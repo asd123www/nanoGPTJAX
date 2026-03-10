@@ -81,26 +81,10 @@ class GroupedQueryAttentionConfig:
     wv_initializer: Callable = dataclasses.field(init=False)
     wo_initializer: Callable = dataclasses.field(init=False)
 
-    wq_logical_axes: Tuple[str, str, str] = (
-        "attn_wqkv_in",
-        "attn_q_heads",
-        "attn_head_dim",
-    )
-    wk_logical_axes: Tuple[str, str, str] = (
-        "attn_wqkv_in",
-        "attn_kv_heads",
-        "attn_head_dim",
-    )
-    wv_logical_axes: Tuple[str, str, str] = (
-        "attn_wqkv_in",
-        "attn_kv_heads",
-        "attn_head_dim",
-    )
-    wo_logical_axes: Tuple[str, str, str] = (
-        "attn_wo_in",
-        "attn_head_dim",
-        "attn_wo_out",
-    )
+    wq_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_q_heads", "attn_head_dim")
+    wk_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_kv_heads", "attn_head_dim")
+    wv_logical_axes: Tuple[str, str, str] = ("attn_wqkv_in", "attn_kv_heads", "attn_head_dim")
+    wo_logical_axes: Tuple[str, str, str] = ("attn_wo_in", "attn_head_dim", "attn_wo_out")
 
     def __post_init__(self):
         self.head_dim = self.d_emb // self.q_heads
@@ -116,7 +100,6 @@ class LinearConfig:
     in_features: int = 768
     out_features: int = 50304
     use_bias: bool = False
-    num_layers: int = 12
     weight_initializer: Callable = None
     weight_logical_axes: Tuple[str, str] = ("linear_in", "linear_out")
 
@@ -125,8 +108,6 @@ class LinearConfig:
 class MLPConfig:
     d_emb: int = 768
     dtype: jnp.dtype = jnp.bfloat16
-    num_layers: int = 12
-
     fc1: LinearConfig = dataclasses.field(init=False)
     fc2: LinearConfig = dataclasses.field(init=False)
 
@@ -135,7 +116,6 @@ class MLPConfig:
             dtype=self.dtype,
             in_features=self.d_emb,
             out_features=self.d_emb * 4,
-            num_layers=self.num_layers,
             weight_initializer=init_uniform(scale=3**0.5 * self.d_emb**-0.5),
             weight_logical_axes=("mlp_fc1_in", "mlp_fc1_out"),
         )
@@ -143,7 +123,6 @@ class MLPConfig:
             dtype=self.dtype,
             in_features=self.d_emb * 4,
             out_features=self.d_emb,
-            num_layers=self.num_layers,
             weight_initializer=jax.nn.initializers.zeros,
             weight_logical_axes=("mlp_fc2_in", "mlp_fc2_out"),
         )
@@ -154,7 +133,7 @@ class ModelConfig:
     seqlen: int = 2048
     vocab_size: int = 50304
     d_emb: int = 768
-    num_layers: int = 12
+    num_layers: int = 16
     q_heads: int = 8
     kv_heads: int = 4
     attn_type: str = "gqa"
@@ -201,16 +180,11 @@ class ModelConfig:
                 q_heads=self.q_heads,
                 kv_heads=self.kv_heads,
             )
-        self.mlp = MLPConfig(
-            dtype=self.dtype,
-            d_emb=self.d_emb,
-            num_layers=self.num_layers,
-        )
+        self.mlp = MLPConfig(dtype=self.dtype, d_emb=self.d_emb)
         self.lm_head = LinearConfig(
             dtype=self.dtype,
             in_features=self.d_emb,
             out_features=self.vocab_size,
-            num_layers=self.num_layers,
             weight_initializer=jax.nn.initializers.normal(stddev=0.001),
         )
 
@@ -248,8 +222,8 @@ class ShardingRules:
 @dataclasses.dataclass
 class CheckpointConfig:
     # Checkpoint related
-    max_checkpoints_to_keep: int = 3
-    checkpoint_save_steps: int = 50
+    max_checkpoints_to_keep: int = 5
+    checkpoint_save_steps: int = 100
     last_checkpoint_step: int = 0
     # Directory where checkpoints will be saved
     save_ckpt_dir: Path | str = ""
@@ -269,18 +243,24 @@ class HyperParams:
     min_lr: float = 6e-5
     embedding_lr: float = 0.2
     unembedding_lr: float = 0.004
+    other_peak_lr: float = 0.02
     b1: float = 0.8
     b2: float = 0.95
     weight_decay: float = 0.0
     cautious_weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
     total_train_steps: int = 10000
-    warmup_steps: int = min(300, 0.01 * total_train_steps)  # ~10% of total steps
+    warmup_steps: int = int(min(300, 0.01 * total_train_steps))  # ~10% of total steps
+
+    # For midtraining and SFT
+    init_lr_frac: float = 0.2
+    final_lr_frac: float = 0.0
+
 
     # Other
     es_patience: int = 500
     val_interval: int = 50
-
+    
 
 @jax_pytree_struct
 class Config:
@@ -290,15 +270,4 @@ class Config:
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     hparams: HyperParams = dataclasses.field(default_factory=HyperParams)
     ckpt_cfg: CheckpointConfig = dataclasses.field(default_factory=CheckpointConfig)
-
-    # Path to the directory where checkpoint needs to be stored
-    ckpt_dir: str = None
-    # Path to the specific checkpoint to be loaded for inference
-    load_ckpt_path: str = None
-
-    # Path to the cached fineweb10B tokens files
-    data_dir: str = None
-
-    # Path to the npz file built using preprocessing in dataloader
-    train_idx_path: str = None
-    val_idx_path: str = None
+    data_dir: Path | str = None
