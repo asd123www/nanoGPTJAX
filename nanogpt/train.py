@@ -1,7 +1,7 @@
 import os
 
 # Set some GPU FLAGS
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"  # Hopper-only!
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ["NCCL_NVLS_ENABLE"] = "1"
 os.environ.update(
     {
@@ -26,11 +26,8 @@ import time
 from pathlib import Path
 from functools import partial
 
-from fineweb_dataloader import make_grain_shard_loader, BOSFinder
-
 import jax
 
-# Hopper-only config! This hurts Blackwell
 jax.config.update("jax_optimization_level", "O1")
 
 import optax
@@ -45,51 +42,63 @@ from jax.sharding import set_mesh
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward
-from optim import build_optimizer
 from utils import logical_to_sharding
+from optim import build_optimizer
 from config import ShardingRules, Config, BATCH_AXIS_NAME
+from fineweb_dataloader import make_grain_shard_loader, BOSFinder
 
 
 logging.getLogger("absl").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*CheckpointManager.*")
 
-# Enable activation checkpointing
-policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-forward_remat = jax.checkpoint(forward, policy=policy)
 
-
-def compute_loss(params, x_batch, y_batch, segment_ids, freqs):
-    logits = forward_remat(params, x_batch, segment_ids, freqs)
-    loss = jnp.mean(
-        optax.losses.softmax_cross_entropy_with_integer_labels(
-            logits=logits, labels=y_batch
+def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
+    logits = forward(params, x_batch, segment_ids, freqs)
+    if loss_mask is not None:
+        per_token_loss = optax.losses.softmax_cross_entropy_with_integer_labels(
+            logits=logits,
+            labels=y_batch,
+            where=loss_mask,
         )
-    )
-    return loss
+        return jnp.sum(per_token_loss) / jnp.maximum(jnp.sum(loss_mask), 1.0)
+    else:
+        return jnp.mean(
+            optax.losses.softmax_cross_entropy_with_integer_labels(
+                logits=logits, labels=y_batch
+            )
+        )
 
 
-@partial(jax.jit, static_argnames=("optim", "grad_accum_steps"), donate_argnums=(0, 1, 4, 5))  # fmt: off
+@partial(
+    jax.jit,
+    static_argnames=("optim", "grad_accum_steps"),
+    donate_argnums=(0, 1, 3, 4, 5),
+)
 def train_step_accum(
     params, x_batch, y_batch, segment_ids, freqs, optim_state, optim, grad_accum_steps
 ):
-    # x_batch, y_batch: [grad_accum_steps, bsz, seqlen]
-    def accum_body(carry, xy):
-        p, opt_state, lsum = carry
+    def body(carry, xy):
+        param, opt_state, lsum = carry
         xb, yb = xy
-        loss, g = jax.value_and_grad(compute_loss)(p, xb, yb, segment_ids, freqs)
-        updates, new_opt_state = optim.update(g, opt_state, p)
-        new_p = optax.apply_updates(p, updates)
-        return (new_p, new_opt_state, lsum + loss), None
+        loss, grad = jax.value_and_grad(compute_loss)(
+            param, xb, yb, segment_ids, freqs, None
+        )
+
+        # MultiSteps accumulates grad internally and returns a zero-tree update on
+        # every micro-step except the last, where it emits the real update.
+        updates, new_opt_state = optim.update(grad, opt_state, param)
+        new_param = optax.apply_updates(param, updates)
+        return (new_param, new_opt_state, lsum + loss), None
 
     carry0 = (params, optim_state, jnp.array(0.0, dtype=jnp.result_type(0.0)))
     (params, optim_state, lsum), _ = jax.lax.scan(
-        accum_body, carry0, (x_batch, y_batch), length=grad_accum_steps
+        body, carry0, (x_batch, y_batch), length=grad_accum_steps
     )
     loss = lsum / grad_accum_steps
     return params, loss, optim_state
 
 
-@partial(jax.jit, static_argnames=("optim",), donate_argnums=(0, 4))
+@partial(jax.jit, static_argnames=("optim",), donate_argnums=(0, 1, 3, 4, 5))
 def train_step(params, x_batch, y_batch, segment_ids, freqs, optim_state, optim):
     loss, grads = jax.value_and_grad(compute_loss)(
         params, x_batch, y_batch, segment_ids, freqs
@@ -101,7 +110,7 @@ def train_step(params, x_batch, y_batch, segment_ids, freqs, optim_state, optim)
 
 @jax.jit
 def val_step(params, x_batch, y_batch, segment_ids, freqs):
-    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs)
+    loss = compute_loss(params, x_batch, y_batch, segment_ids, freqs, None)
     return loss
 
 
@@ -166,8 +175,12 @@ def main():
     print("\nNumber of train files found: ", num_train_files)
     print("Number of validation files found: ", num_val_files)
 
-    train_dl = make_grain_shard_loader(train_files)
-    val_dl = make_grain_shard_loader(val_files)
+    train_dl = make_grain_shard_loader(
+        train_files, prefetch=16, num_threads=32, prefetch_buffer_size=16
+    )
+    val_dl = make_grain_shard_loader(
+        val_files, prefetch=0, num_threads=16, prefetch_buffer_size=16
+    )
     train_iter = iter(train_dl)
 
     per_device_bsz = cfg.hparams.per_device_batch_size
@@ -175,7 +188,6 @@ def main():
     seqlen = cfg.model.seqlen
     head_dim = cfg.model.attn.head_dim
     data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
-    # This is for the buffer that we would create for gradient accumulation
     data_accum_sharding = logical_to_sharding(
         (None, "batch", None), cfg.mesh, cfg.rules
     )
@@ -184,8 +196,7 @@ def main():
     min_lr = 0.01 * max_lr
     warmup_steps = cfg.hparams.warmup_steps
     desired_batch_size = cfg.hparams.desired_batch_size
-    grad_accum_steps = max(4, desired_batch_size // (bsz * seqlen))
-
+    grad_accum_steps = max(2, desired_batch_size // (bsz * seqlen))
     total_train_steps = cfg.hparams.total_train_steps
     max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
     checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
@@ -255,6 +266,10 @@ def main():
     with set_mesh(cfg.mesh):
         freqs = precompute_frequencies(positions=positions, features=head_dim)
 
+    # Because our dataloader already ensures that sequence in a batch have
+    # tokens equal to the context window, we do not need sequence packing here
+    # Hence, we can segment_ids to None for pretraining.
+    segment_ids = None
     resume_from_step = cfg.ckpt_cfg.last_checkpoint_step
 
     if resume_from_step > 0:
@@ -298,8 +313,8 @@ def main():
             print("Finished checkpointing! Cleaned.")
             break
 
-        tokens = shard["tokens"]  # SharedMemoryArray(uint16, shape=[num_tokens])
-        bos_idx = shard["bos_idx"]  # np.ndarray of BOS positions
+        tokens = shard["tokens"]
+        bos_idx = shard["bos_idx"]
         size = shard["size"]
         shard_name = Path(shard["path"]).name
 
@@ -311,11 +326,7 @@ def main():
 
             # build the static index once per shard (on-demand)
             num_batches_in_shard = bf.build(bsz, seqlen)
-
-            print(
-                f"\n=== Processing Shard: {num_shards_used} with name: {shard_name}",
-                end=" | ",
-            )
+            print(f"\n=== Processing Shard: {num_shards_used} with name: {shard_name}", end=" | ")  # fmt: off
             print(f"Indexed {num_batches_in_shard} batches ===")
 
             while not shard_processed_fully:
@@ -342,6 +353,7 @@ def main():
                         model,
                         stacked_x,
                         stacked_y,
+                        segment_ids,
                         freqs,
                         optim_state,
                         optim,
@@ -350,15 +362,18 @@ def main():
 
                     # Block for accurate timing
                     jax.block_until_ready(loss)
-
                     end = time.time()
                     dt = end - start
                     train_time_elapsed = (end - train_start_time) / 60  # in minutes
-
-                    step += 1
                     tokens_processed = bsz * seqlen * grad_accum_steps
                     total_tokens_consumed += tokens_processed
                     tokens_per_sec = int(tokens_processed / dt)
+
+                    # fmt: off
+                    print(f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Train time: {train_time_elapsed:6.2f} min | Tokens processed/s: {tokens_per_sec:>9,}")
+                    # fmt: on
+
+                    step += 1
 
                     if (step % options.save_interval_steps) == 0:
                         mngr.save(
@@ -369,9 +384,6 @@ def main():
                                 ds=grain.checkpoint.CheckpointSave(train_iter),
                             ),
                         )
-                    print(
-                        f"Step: [{str(step).zfill(len(str(total_train_steps)))}/{total_train_steps}] | loss: {loss:8.4f} | Step time: {dt:5.2f} s | Train time: {train_time_elapsed:6.2f} min | Tokens processed/s: {tokens_per_sec:>9,}"
-                    )
 
                     if step >= total_train_steps:
                         print(
@@ -387,11 +399,11 @@ def main():
                 except StopIteration:
                     # Once we have trained on one shard, let's validate the performance as well
                     shard_processed_fully = True
-                    num_shards_used +=1
+                    num_shards_used += 1
                     print("Shard exhausted")
                     print(f"Total shards consumed: {num_shards_used:<5}")
                     print(f"Total Tokens consumed: {total_tokens_consumed:>9,}")
-                    print("-"*75)
+                    print("-" * 75)
 
                     print("\nScoring model performance on validation data...\n")
                     val_loss = 0.0
@@ -417,16 +429,15 @@ def main():
                                     seqlen,
                                     val_tokens,
                                     data_sharding,
-                                    val_data_buf
-                                )
-                                curr_val_data = jnp.asarray(
                                     val_data_buf,
-                                    dtype=jnp.int32,
-                                    device=data_sharding
+                                )
+
+                                curr_val_data = jnp.asarray(
+                                    val_data_buf, dtype=jnp.int32, device=data_sharding
                                 )
                                 x = curr_val_data[:, :-1]
                                 y = curr_val_data[:, 1:]
-                                loss = val_step(model, x, y, None, freqs)
+                                loss = val_step(model, x, y, segment_ids, freqs)
                                 val_loss += loss.item()
                                 val_steps_count += 1
                         finally:
@@ -442,9 +453,13 @@ def main():
                         es_patience_counter += 1
 
                     if es_patience_counter > es_patience:
-                        print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
+                        print(
+                            f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps."
+                        )
                         print(f"Total number of shards consumed : {num_shards_used}")
-                        print(f"Best loss                       : {best_loss:.4f} at step {best_step}")
+                        print(
+                            f"Best loss                       : {best_loss:.4f} at step {best_step}"
+                        )
                         mngr.wait_until_finished()
                         training_complete = True
                         break
