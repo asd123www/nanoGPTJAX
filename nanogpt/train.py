@@ -453,13 +453,11 @@ def main():
                         es_patience_counter += 1
 
                     if es_patience_counter > es_patience:
-                        print(
-                            f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps."
-                        )
+                         # fmt: off
+                        print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
                         print(f"Total number of shards consumed : {num_shards_used}")
-                        print(
-                            f"Best loss                       : {best_loss:.4f} at step {best_step}"
-                        )
+                        print(f"Best loss                       : {best_loss:.4f} at step {best_step}")
+                         # fmt: on
                         mngr.wait_until_finished()
                         training_complete = True
                         break
