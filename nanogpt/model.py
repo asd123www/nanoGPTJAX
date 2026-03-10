@@ -211,8 +211,19 @@ def compute_segment_mask(segment_ids):
     """Compute once, reuse across all layers. Returns (B, 1, T, S) bias or None."""
     if segment_ids is None:
         return None
+
+    # (B, T) valid token positions (segment_id != 0)
+    # We discard padding tokens as valid tokens. 
+    valid_segment_ids = jnp.where(segment_ids != 0, 1, 0)
+
+    # (B, T, T) same segment
     same_segment = jnp.equal(segment_ids[:, :, None], segment_ids[:, None, :])
-    return same_segment[:, None, :, :]
+
+    # (B, T, T) valid on both query and key axes
+    valid = valid_segment_ids[:, :, None] & valid_segment_ids[:, None, :]
+
+    mask = (same_segment & valid).astype(jnp.bool)
+    return mask[:, None, :, :]  # (B, 1, T, T)
 
 
 def forward(params, x, segment_ids, freqs):
