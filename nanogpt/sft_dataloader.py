@@ -1,23 +1,27 @@
-"""This dataloader is specifically build for mid-training/SFT stages. Here are a
-few noticeable things about this:
-
--
-"""
-
-import os
 import json
 import grain
 import tiktoken
 import argparse
 import numpy as np
+from pathlib import Path
+from functools import partial
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from tqdm import tqdm
-from pathlib import Path
-from tqdm import tqdm
-from functools import partial
-from datasets import load_dataset
+from tasks.mmlu import MMLU
+
+# from tasks.arc import ARC
+from tasks.gsm8k import GSM8K
+from tasks.smoltalk import SmolTalk
+
+
+ROLE_MAP = {
+    "system": ("system_start", "system_end"),
+    "user": ("user_start", "user_end"),
+    "assistant": ("assistant_start", "assistant_end"),
+    "tool": ("tool_start", "tool_end"),
+}
 
 
 def prepare_train_batch(batch):
@@ -62,6 +66,27 @@ def prepare_train_accum_batch(batch, grad_accum_steps):
     return out
 
 
+def truncate_to_seqlen(sample, max_len: int):
+    ids = sample["input_ids"]
+    mask = sample["completion_mask"]
+    # Truncate both consistently
+    if ids.shape[0] > max_len:
+        ids = ids[:max_len]
+        mask = mask[:max_len]
+    sample["input_ids"] = ids
+    sample["completion_mask"] = mask
+    return sample
+
+
+def has_completion_tokens(example):
+    """
+    Filter out chunks where truncation left only masked (prompt) tokens.
+    Such chunks would cause CrossEntropyLoss(reduction='mean') to return
+    nan due to 0/0 when every label is the ignore index.
+    """
+    return bool(example["completion_mask"].any())
+
+
 def build_tokenizer():
     """Build a GPT-2 tokenizer extended with custom chat tokens."""
     user_start = "<|user_start|>"
@@ -75,6 +100,7 @@ def build_tokenizer():
     pad_token = "<|pad|>"
 
     custom_tokens = [
+        pad_token,
         user_start,
         user_end,
         assistant_start,
@@ -83,7 +109,6 @@ def build_tokenizer():
         system_end,
         tool_start,
         tool_end,
-        pad_token,
     ]
 
     base = tiktoken.get_encoding("gpt2")
@@ -134,16 +159,8 @@ def decode_mask_from_ids(batch):
     return batch
 
 
-ROLE_MAP = {
-    "system": ("system_start", "system_end"),
-    "user": ("user_start", "user_end"),
-    "assistant": ("assistant_start", "assistant_end"),
-    "tool": ("tool_start", "tool_end"),
-}
-
-
 def format_conversation(example, tok_info):
-    """Format a single or multi-turn chat example into a string ready for tokenization."""
+    """Format a single or multi-turn chat example into a string ready for tokenisation."""
     messages = example.get("messages", [])
     if not messages:
         return None
@@ -162,204 +179,214 @@ def format_conversation(example, tok_info):
 
     roles = {m.get("role") for m in messages}
 
-    if "user" not in roles or "assistant" not in roles:
+    # We only want samples where we have assistant completions
+    if "assistant" not in roles:
         return None
 
     return {"text": "".join(parts)}
 
 
-def tokenize(example, tok_info):
-    """Tokenize text and bake the completion mask into the sign bit."""
+def tokenize_dataset(ds, tok_info, threshold_percentile=None, num_threads=32):
     tokenizer = tok_info["tokenizer"]
-    tokens = np.array(
-        tokenizer.encode(example["text"], allowed_special="all"),
-        dtype=np.int32,
+    ast_start_id = tok_info["assistant_start_id"]
+    ast_end_id = tok_info["assistant_end_id"]
+
+    # Format conversations
+    formatted = []
+    for example in ds:
+        result = format_conversation(example, tok_info)
+        if result is not None:
+            formatted.append(result["text"])
+
+    # Batch tokenize
+    all_tokens = tokenizer.encode_batch(
+        formatted,
+        num_threads=num_threads,
+        allowed_special="all",
     )
 
-    ast_start = tok_info["assistant_start_id"]
-    ast_end = tok_info["assistant_end_id"]
+    # Stats
+    lengths = np.array([len(t) for t in all_tokens])
+    log_lengths = np.log1p(lengths)
+    q1, q3 = np.percentile(log_lengths, [25, 75])
+    iqr = q3 - q1
+    fence = np.expm1(q3 + 3.0 * iqr)
 
-    mask = np.zeros(len(tokens), dtype=np.bool_)
+    print(f"Total formatted:   {len(lengths)}")
+    print(f"Median:            {np.expm1(np.median(log_lengths)):.0f} tokens")
+    print(f"P95:               {np.expm1(np.percentile(log_lengths, 95)):.0f} tokens")
+    print(f"P99:               {np.expm1(np.percentile(log_lengths, 99)):.0f} tokens")
+    print(f"log-IQR fence:     {fence:.0f} tokens")
 
-    inside_assistant = False
-    for i, tok in enumerate(tokens):
-        if tok == ast_start:
-            inside_assistant = True
-            continue
-        if tok == ast_end:
-            mask[i] = True
-            inside_assistant = False
-            continue
-        if inside_assistant:
-            mask[i] = True
-
-    return {"input_ids": encode_mask_into_ids(tokens, mask)}
-
-
-# We will save the parquet files in this format
-PARQUET_SCHEMA = pa.schema(
-    [
-        ("input_ids", pa.list_(pa.int32())),
-    ]
-)
-
-
-def save_tokenized(
-    dataset_path, data_dir, tok_info, split, records_per_shard, subset="openhermes-100k"
-):
-    """Stream-download, tokenize, sign-encode, and write Parquet shards."""
-
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-
-    name = dataset_path.split("/")[-1]
-    prefix = f"{name}_{subset}" if subset and subset != "all" else name
-
-    if subset and subset != "all":
-        ds = load_dataset(dataset_path, subset, split=split, streaming=True)
+    # (Optional) Filter
+    if threshold_percentile is not None:
+        threshold = int(np.percentile(lengths, threshold_percentile))
+        print(f"Threshold (P{threshold_percentile}):   {threshold} tokens")
+        keep_mask = lengths <= threshold
     else:
-        ds = load_dataset(dataset_path, split=split, streaming=True)
+        keep_mask = np.ones(len(lengths), dtype=bool)
 
+    num_kept = int(keep_mask.sum())
+    print(
+        f"Tokens kept:  {num_kept} / {len(lengths)} ({100 * num_kept / len(lengths):.2f}%)"
+    )
+
+    # Compute completion mask + sign-bit encode
+    encoded = []
+    num_no_completion = 0  # some completions may get truncated after filtering
+
+    for tokens, keep in zip(all_tokens, keep_mask):
+        if not keep:
+            continue
+
+        tokens_arr = np.array(tokens, dtype=np.int32)
+        starts = np.where(tokens_arr == ast_start_id)[0]
+        ends = np.where(tokens_arr == ast_end_id)[0]
+        completion_mask = np.zeros(len(tokens_arr), dtype=bool)
+        num_pairs = min(len(starts), len(ends))
+
+        for curr_start, curr_end in zip(starts[:num_pairs], ends[:num_pairs]):
+            completion_mask[curr_start + 1 : curr_end + 1] = True
+
+        if len(starts) > len(ends) and len(starts) > 0:
+            completion_mask[starts[-1] + 1 :] = True
+
+        if not completion_mask.any():  # drop prompt-only samples
+            num_no_completion += 1
+            continue
+
+        encoded.append(encode_mask_into_ids(tokens_arr, completion_mask))
+
+    num_kept = len(encoded)
+    print(
+        f"Tokens kept: {num_kept} / {len(lengths)} ({100 * num_kept / len(lengths):.2f}%)"
+    )
+    print(f"Dropped (length): {int((~keep_mask).sum())}")
+    print(f"Dropped (no completion): {num_no_completion}")
+    return encoded
+
+
+def save_to_parquet(
+    encoded, output_dir, task_name, split="train", rows_per_shard=64_000
+):
+    out = Path(output_dir) / task_name
+    out.mkdir(parents=True, exist_ok=True)
+
+    schema = pa.schema([pa.field("input_ids", pa.list_(pa.int32()))])
     shard_idx = 0
-    total_written = 0
-    skipped = 0
-    buffer = []
+    buf = []
+    num_written = 0
 
-    def shard_path(idx):
-        return os.path.join(data_dir, f"{prefix}_{split}-{idx:05d}.parquet")
+    def flush(arrays, idx):
+        offsets = np.zeros(len(arrays) + 1, dtype=np.int32)
 
-    def flush_buffer():
-        nonlocal shard_idx
-        if not buffer:
-            return
-        table = pa.table({"input_ids": buffer}, schema=PARQUET_SCHEMA)
-        pq.write_table(table, shard_path(shard_idx))
-        buffer.clear()
+        for idx, array in enumerate(arrays):
+            offsets[idx + 1] = offsets[idx] + len(array)
+
+        flat = np.concatenate(arrays)
+        pa_col = pa.ListArray.from_arrays(
+            pa.array(offsets, type=pa.int32()), pa.array(flat, type=pa.int32())
+        )
+
+        path = out / f"{split}_{shard_idx:05d}.parquet"
+        pq.write_table(
+            pa.table({"input_ids": pa_col}, schema=schema), path, compression="zstd"
+        )
+        print(f"Shard {shard_idx:05d} containing {len(arrays)} rows → {path}")
+
+    for arr in encoded:
+        buf.append(arr)
+        num_written += 1
+        if len(buf) >= rows_per_shard:
+            flush(buf, shard_idx)
+            buf = []
+            shard_idx += 1
+
+    if buf:
+        flush(buf, shard_idx)
         shard_idx += 1
 
-    pbar = tqdm(desc=f"Tokenizing {prefix}/{split}", unit=" examples")
-
-    for example in ds:
-        formatted = format_conversation(example, tok_info)
-        if formatted is None:
-            skipped += 1
-            pbar.set_postfix(written=total_written, skipped=skipped, shard=shard_idx)
-            pbar.update(1)
-            continue
-
-        tokenized = tokenize(formatted, tok_info)
-        buffer.append(tokenized["input_ids"].tolist())
-        total_written += 1
-
-        pbar.set_postfix(written=total_written, skipped=skipped, shard=shard_idx)
-        pbar.update(1)
-
-        if len(buffer) >= records_per_shard:
-            flush_buffer()
-
-    # Flush remaining — no minimum size constraint with Parquet
-    flush_buffer()
-    pbar.close()
-
     meta = {
-        "dataset": dataset_path,
-        "subset": subset,
+        "task": task_name,
         "split": split,
-        "dtype": "int32",
-        "total_records": total_written,
-        "num_shards": shard_idx,
-        "bos_token_id": tok_info["bos_id"],
+        "n_rows": num_written,
+        "n_shards": shard_idx,
+        "rows_per_shard": rows_per_shard,
     }
-    meta_path = os.path.join(data_dir, f"{prefix}_{split}_meta.json")
-    with open(meta_path, "w") as f:
+    with open(out / f"{split}_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"\nWrote {total_written} records across {shard_idx} shard(s) to {data_dir}")
-    print(f"Skipped {skipped} examples")
-    print(f"Metadata saved to {meta_path}")
-
-
-# ---------------------------------------------------------------------------
-# Grain loader helpers
-# ---------------------------------------------------------------------------
-
-
-def get_shard_paths(data_dir, split="train"):
-    """Return sorted list of Parquet shard paths for the given split."""
-    paths = sorted(Path(data_dir).glob(f"*{split}*.parquet"))
-    print(f"Number of files found: ", len(paths))
-    return [str(p) for p in paths]
-
-
-def load_meta(data_dir, split="train"):
-    for fname in os.listdir(data_dir):
-        if fname.endswith(f"{split}_meta.json"):
-            with open(os.path.join(data_dir, fname)) as f:
-                return json.load(f)
-    raise FileNotFoundError(f"No {split}_meta.json found in {data_dir}")
-
-
-def load_all_token_rows(shard_paths):
-    """Read all Parquet shards into a list of np.int32 arrays."""
-    rows = []
-    for path in shard_paths:
-        table = pq.read_table(path, columns=["input_ids"])
-        for row in table["input_ids"]:
-            rows.append(np.array(row.as_py(), dtype=np.int32))
-    return rows
-
-
-class ParquetTokenSource:
-    """A Grain-compatible random-access source backed by Parquet shards.
-
-    Reads all shards into memory once (token IDs are small),
-    then serves individual rows by index.
-    """
-
-    def __init__(self, shard_paths):
-        self._rows = load_all_token_rows(shard_paths)
-
-    def __len__(self):
-        return len(self._rows)
-
-    def __getitem__(self, idx):
-        return {"input_ids": self._rows[idx]}
+    print(f"Written {num_written} rows in {shard_idx} shard -> {out}")
 
 
 def make_grain_shard_loader(
-    batch_size,
-    sequence_length,
-    grad_accum_steps,
-    data_sharding,
-    data_dir,
-    split="train",
-    repeat=True,
-    cpu_buffer_size=16,
-    device_buffer_size=4,
+    data_dir: str,
+    split: str,
+    pad_id: int,
+    batch_size: int,
+    sequence_length: int,
+    grad_accum_steps: int = 1,
+    data_sharding=None,
+    # Packing controls
+    num_packing_bins: int = 64,
+    max_sequences_per_bin: int = 16,
+    # Laziness / performance controls (thread-only)
+    cycle_length: int = 8,
+    iter_buffer_size: int = 64,
+    num_make_iter_threads: int = 2,
+    make_iter_buffer_size: int = 4,
+    # Multithreading
+    multi_threading: bool = True,
+    prefetch_threads: int = 8,
+    prefetch_buffer_size: int = 256,
+    # Device put buffers
+    cpu_buffer_size: int = 16,
+    device_buffer_size: int = 4,
+    # Shuffle
+    shuffle=False,
+    shuffle_seed: int = 1234,
 ):
-    shard_paths = get_shard_paths(data_dir, split)
-    meta = load_meta(data_dir, split)
-    source = ParquetTokenSource(shard_paths)
+    packed_len = sequence_length + 1
+    shard_paths = list(Path(data_dir).glob(f"**/*{split}*.parquet"))
+    print(f"Number of {split} files found: {len(shard_paths)}")
+    paths_ds = grain.MapDataset.source(shard_paths)
+    per_file = paths_ds.map(lambda p: grain.experimental.ParquetIterDataset(p))
 
-    ds = grain.MapDataset.source(source)
-    if repeat:
-        ds = ds.shuffle(1234).repeat()
+    ds = grain.experimental.InterleaveIterDataset(
+        per_file,
+        cycle_length=min(cycle_length, len(shard_paths)),
+        num_make_iter_threads=num_make_iter_threads,
+        make_iter_buffer_size=make_iter_buffer_size,
+        iter_buffer_size=iter_buffer_size,
+    )
+    if shuffle:
+        ds = ds.shuffle(shuffle_seed)
+
+    ds = ds.map(decode_mask_from_ids)
+    ds = ds.map(partial(truncate_to_seqlen, max_len=packed_len))
+    ds = ds.filter(has_completion_tokens)
+
+    length_struct = {"input_ids": packed_len, "completion_mask": packed_len}
+    padding_struct = {"input_ids": pad_id, "completion_mask": 0}
+
+    ds = grain.experimental.BestFitPackIterDataset(
+        parent=ds,
+        length_struct=length_struct,
+        num_packing_bins=num_packing_bins,
+        max_sequences_per_bin=max_sequences_per_bin,
+        padding_struct=padding_struct,
+    )
 
     total_batch_size = (
         grad_accum_steps * batch_size if grad_accum_steps > 1 else batch_size
     )
 
-    ds = grain.experimental.ConcatThenSplitIterDataset(
-        parent=ds,
-        length_struct={"input_ids": sequence_length},
-        split_full_length_features=True,
-        bos_handling=grain.experimental.BOSHandling.REPLACE_FIRST_TOKEN_WITH_BOS,
-        bos_features=("input_ids",),
-        bos_token_id=meta["bos_token_id"],
-    ).batch(total_batch_size, drop_remainder=True)
+    if multi_threading:
+        ds = grain.experimental.multithread_prefetch(
+            ds, num_threads=prefetch_threads, buffer_size=prefetch_buffer_size
+        )
 
-    # Recover completion_mask from sign bit
-    ds = ds.map(decode_mask_from_ids)
+    ds = ds.batch(total_batch_size, drop_remainder=True)
 
     if grad_accum_steps > 1:
         ds = ds.map(
@@ -375,42 +402,70 @@ def make_grain_shard_loader(
             cpu_buffer_size=cpu_buffer_size,
             device_buffer_size=device_buffer_size,
         )
-
     return ds
 
 
 def main(args):
     tok_info = build_tokenizer()
-    print(f"Vocab size: {tok_info['vocab_size']}")
-    print(f"BOS id:     {tok_info['bos_id']}")
-    print(f"Assistant start id: {tok_info['assistant_start_id']}")
+    train_tasks = {
+        "smoltalk": SmolTalk(split="train"),
+        "mmlu": MMLU(subset="auxiliary_train", split="train"),
+        "gsm8k": GSM8K(subset="main", split="train"),
+        # "simplespelling": SimpleSpelling(size=200000, split="train", base_dir=data_dir),
+        # "spellingbee":   SpellingBee(size=80000, split="train", base_dir=data_dir),
+    }
 
-    save_tokenized(
-        args.dataset_path,
-        args.save_data_dir,
-        tok_info,
-        split=args.split,
-        records_per_shard=args.records_per_shard,
-    )
+    for task_name, ds in train_tasks.items():
+        print(f"\nTask name: {task_name}")
+        if task_name == "smoltalk":
+            threshold_percentile = 99.9
+        else:
+            threshold_percentile = None
+        encoded = tokenize_dataset(
+            ds, tok_info, threshold_percentile=threshold_percentile
+        )
+        save_to_parquet(encoded, args.save_data_dir, task_name, split="train")
+
+    val_tasks = {
+        "smoltalk": SmolTalk(split="test"),  # 24K rows in test set
+        "mmlu": MMLU(
+            subset="all", split="test", stop=5200
+        ),  # 14K rows in test set, use only 5.2K to match the train ratios
+        "gsm8k": GSM8K(
+            subset="main", split="test", stop=420
+        ),  # 1.32K rows in test set, use only 420 to match the train ratios
+    }  # total: 24K + 14K + 1.32K ~= 39K rows
+
+    for task_name, ds in val_tasks.items():
+        print(f"\nTask name: {task_name}")
+        if task_name == "smoltalk":
+            threshold_percentile = 99.9
+        else:
+            threshold_percentile = None
+        encoded = tokenize_dataset(
+            ds, tok_info, threshold_percentile=threshold_percentile
+        )
+        save_to_parquet(encoded, args.save_data_dir, task_name, split="test")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Argument Parser for Mid-training")
     parser.add_argument(
-        "--dataset_path", help="Name of the dataset (on HF)", required=True
-    )
-    parser.add_argument(
         "--save_data_dir",
         help="Directory to save the tokenized records",
-        required=True,
-        default="/home/ubuntu/nanochat/jaxnano/sft_data/",
+        default="/home/ubuntu/midtrain_data/",
     )
     parser.add_argument(
         "--records_per_shard",
         help="Number of records to write per shard",
-        default=10_0000,
+        default=64_000,
         type=int,
     )
-    parser.add_argument("--split", help="Data split to download", required=True)
+    parser.add_argument(
+        "--mmlu_epochs", help="Number of passes for MMLU", default=1, type=int
+    )
+    parser.add_argument(
+        "--gsm8k_epochs", help="Number of passes for GSM8K", default=1, type=int
+    )
     args = parser.parse_args()
     main(args)
