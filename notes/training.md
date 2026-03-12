@@ -382,7 +382,7 @@ complicate a bit on the data loader side. If our sequence length or context wind
 data used to train the models won't have that many tokens. We have two choices there:
 
 - Pad the sequences to max sequence length (utter waste of compute!)
-- Do sequence packing but with a very good algorithm (Concat then split in our case!)
+- Do sequence packing but with a very good algorithm (BestFit in our case!)
 
 When we do seuqnece packing, we also need information on which tokens belong to which sample in the sequence. This is where `segment_ids` comes handy. But wait,
 why is that information necessary? What can go wrong if you do not have segment information? Well, if you do not have the segment information, your positional
@@ -392,27 +392,47 @@ frequencies on the fly as opposed to static calculation during pretraining.
 Also, we would tokenize and save the sequence rather than doing tokenization on fly as it will be extremely skow
 
 ```python
-source = ParquetTokenSource(shard_paths)
+# Assuming we have tokenized the dataset and saved it in parqauet files already
+paths_ds = grain.MapDataset.source(shard_paths)
+per_file = paths_ds.map(lambda p: grain.experimental.ParquetIterDataset(p))
 
-ds = grain.MapDataset.source(source)
-if repeat:
-    ds = ds.shuffle(1234).repeat()
+ds = grain.experimental.InterleaveIterDataset(
+    per_file,
+    cycle_length=min(cycle_length, len(shard_paths)),
+    num_make_iter_threads=num_make_iter_threads,
+    make_iter_buffer_size=make_iter_buffer_size,
+    iter_buffer_size=iter_buffer_size,
+)
+if shuffle:
+    ds = ds.shuffle(shuffle_seed)
+
+ds = ds.map(decode_mask_from_ids)
+ds = ds.map(partial(truncate_to_seqlen, max_len=packed_len))
+ds = ds.filter(has_completion_tokens)
+
+length_struct = {"input_ids": packed_len, "completion_mask": packed_len}
+# We need to tell the iterator what pad `id` to use for input_ids and completion_mask
+# For input_ids, we will use the padding id from our tokenizer. For completions mask,
+# we will pad it using zeros, as they are going to filtered anyway.
+padding_struct={"input_ids": pad_id, "completion_mask": 0}
+
+ds = grain.experimental.BestFitPackIterDataset(
+    parent=ds,
+    length_struct=length_struct,
+    num_packing_bins=num_packing_bins,
+    max_sequences_per_bin=max_sequences_per_bin,
+    padding_struct=padding_struct,
+)
 
 total_batch_size = grad_accum_steps * batch_size if grad_accum_steps > 1 else batch_size
 
-ds = grain.experimental.ConcatThenSplitIterDataset(
-    parent=ds,
-    length_struct={"input_ids": sequence_length},
-    split_full_length_features=True,
-    bos_handling=grain.experimental.BOSHandling.REPLACE_FIRST_TOKEN_WITH_BOS,
-    bos_features=("input_ids",),
-    bos_token_id=meta["bos_token_id"],
-).batch(total_batch_size, drop_remainder=True)
+if multi_threading:
+    ds = grain.experimental.multithread_prefetch(
+        ds, num_threads=prefetch_threads, buffer_size=prefetch_buffer_size
+    )
 
-# Recover completion_mask from sign bit
-ds = ds.map(decode_mask_from_ids)
+ds = ds.batch(total_batch_size, drop_remainder=True)
 
-# Grain gives the ability to load sharded tokens
 if grad_accum_steps > 1:
     ds = ds.map(partial(prepare_train_accum_batch, grad_accum_steps=grad_accum_steps))
 else:
@@ -425,5 +445,6 @@ if data_sharding is not None:
         cpu_buffer_size=cpu_buffer_size,
         device_buffer_size=device_buffer_size,
     )
+return ds
 ```
 
