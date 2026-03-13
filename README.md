@@ -64,7 +64,7 @@ uv sync
 uv sync --all-extras
 ```
 
-4. Prepare the dataset
+4. Prepare the dataset for pretraining
 ```
 # Download the dataset
 python download_fineweb_tokens.py
@@ -77,9 +77,19 @@ python download_fineweb_tokens.py
 python nanogpt/train.py
 ```
 
-6. Run inference by providing the checkpoint path
+6. (Optional) Fine-tune model on conversational dataset
 ```
-# Change this in the config file
+# Prepare the SFT dataset. Change args if you want to
+python sft_downloader.py
+
+# Fine-tune the model using the above data
+python train_sft.py
+```
+
+7. Run inference by providing the checkpoint path
+```
+# Change this in the config file. Load the checkpoint 
+# that is appropriate for the task (pretrain results/SFT results)
 load_ckpt_path = /home/.../params  # absolute path only
 
 # Run the inference code
@@ -88,6 +98,8 @@ python nanogpt/inference.py
 <br>
 
 ## Results
+
+#### Pretraining
 
 After pretraining the model on first 30 shards of Fineweb10B tokens, here are some sample outputs from the mode:
 
@@ -101,7 +113,7 @@ prompts = [
         "<|endoftext|>Some say we are tired far",
         "<|endoftext|>The capital of France",
     ]
----
+
 
 Completions:
 
@@ -120,6 +132,28 @@ You don’
 <|endoftext|>The capital of France, Paris, is the birthplace of many art treasures. The city has a rich history of art and architecture, and a beautiful
 city park is a place to relax and enjoy the peace. The city also features a number of historical buildings and museums, which
 ```
+<br>
+
+#### Midtrain/SFT
+
+After fine-tuning the model on a very small dataset (smoltalk, MMLU, ang GSM8K) for 500 steps, here are some results:
+
+```
+prompt:
+
+<|endoftext|><|user_start|>What are the benefits of regular exercise? Your response should contain at least 3 sentences. Include keywords such as "health", "reduce", and "improve".
+<|user_end|>
+<|assistant_start|>
+
+
+completion:
+
+Regular exercise enhances cognitive abilities, promoting cognitive strength, focus, and attention. It improves circulation and reduces symptoms of illness, such as exhaustion and muscle cramps. Additionally, regular exercise lowers your cholesterol level to preserve cardiovascular control while minimizing side effects (like
+```
+**Note:**
+
+1. For the base version (12 layers), we fine-tuned it on a small dataset (smoltalk, MMLU, GSM8K) with *completion-only* training.
+2. For SFT, we use Adam with no weight decay instead of Muon. 
 <br>
 
 ## Benchmarking 
