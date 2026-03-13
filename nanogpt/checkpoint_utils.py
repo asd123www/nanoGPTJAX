@@ -1,5 +1,6 @@
 import jax
 import grain
+import hashlib
 import orbax.checkpoint as ocp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -108,6 +109,159 @@ def load_weights_from_checkpoint(path, sharding):
         )
 
 
+def tree_path_to_str(path):
+    """Converts flattened tree path with leaves into a string.
+
+    Args:
+        path: leaf path
+    Returns:
+        A combined string representation of the path
+    """
+
+    parts = []
+    for p in path:
+        if hasattr(p, "key"):
+            parts.append(str(p.key))
+        elif hasattr(p, "name"):
+            parts.append(str(p.name))
+        elif hasattr(p, "idx"):
+            parts.append(str(p.idx))
+        else:
+            parts.append(str(p))
+    return "/".join(parts)
+
+
+def extract_shapes_and_dtypes(tree):
+    """Extracts the shapes and dtypes of leaves (arrays) from a pytree.
+
+    Args:
+        tree: A PyTree instance
+    Returns:
+        A dictionary of leaves where the value corresponding to a leaf
+        contains the shape and dtype of that leaf. A leaf here represents
+        a jax array (e.g. model weights).
+    """
+
+    path_vals, _ = jax.tree_util.tree_flatten_with_path(tree)
+    flattened = {}
+    for path, leaf in path_vals:
+        if leaf is None:
+            continue
+        if not hasattr(leaf, "shape"):
+            continue
+        flattened[tree_path_to_str(path)] = leaf
+    return {k: (tuple(v.shape), str(v.dtype)) for k, v in flattened.items()}
+
+
+def get_schema_hash(tree):
+    """Extracts the schema (shapes and dtypes) of a pytree, and calculates
+    a hash of it."""
+    schema = extract_shapes_and_dtypes(tree)
+    entries = [f"{k}:{shape}:{dtype}" for k, (shape, dtype) in schema.items()]
+    entries.sort()
+    blob = "\n".join(entries)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def pytrees_equal(pytree1, pytree2):
+    return extract_shapes_and_dtypes(pytree1) == extract_shapes_and_dtypes(pytree2)
+
+
+def print_diff(params_struct, ckpt_struct):
+    """Prints the difference between two abstract pytrees structures."""
+
+    params_schema = extract_shapes_and_dtypes(params_struct)
+    ckpt_schema = extract_shapes_and_dtypes(ckpt_struct)
+
+    param_schema_set = set(params_schema)
+    ckpt_schema_set = set(ckpt_schema)
+
+    missing = sorted(param_schema_set - ckpt_schema_set)
+    extra = sorted(ckpt_schema_set - param_schema_set)
+    mismatch = sorted(
+        k
+        for k in params_schema.keys() & ckpt_schema.keys()
+        if params_schema[k] != ckpt_schema[k]
+    )
+
+    if not missing and not extra and not mismatch:
+        print("Pytree match!")
+        return True
+
+    if missing:
+        print("\nMissing in checkpoint:")
+        for key in missing:
+            print(" ", key, params_schema[key])
+
+    if extra:
+        print("\nExtra in checkpoint:")
+        for key in extra:
+            print(" ", key, ckpt_schema[key])
+
+    if mismatch:
+        print("\nShape or dtype mismatch found!")
+        for key in mismatch:
+            print("Key: ", key)
+            print("    Param schema: ", params_schema[key])
+            print("    Ckpt  schema: ", ckpt_schema[key], "\n")
+
+
+def validate_checkpoint(params_struct, ckpt_struct, strict=True):
+    """Checks if the current param pytree is valid for a given checkpoint.
+
+    Args:
+        param_struct: Abstract pytree of the current params
+        ckpt_struct : Abstract pytree of the checkpoint
+    Returns:
+        True/False depending on whether the param abstract pytree matches
+        with the abstract pytree of the given checkpoint.
+    """
+
+    model_hash = get_schema_hash(params_struct)
+    ckpt_hash = get_schema_hash(ckpt_struct)
+    return model_hash == ckpt_hash
+
+
+# There is a bug in orbax where it can silently restore a pytree partially even
+# when strict is enabled. It will likely be fixed in the v1 API. For now, we will
+# use this custom function along with some utilities to ensure that we only load
+# checkpoint if the pytree structure, data types and shapes matches exactly!
+def load_weights_from_checkpoint_with_validation(path, params, sharding, strict=True):
+    print(f"Reading checkpoint metadata from: {path}")
+    with ocp.PyTreeCheckpointer() as ckptr:
+        ckpt_metadata = ckptr.metadata(path)
+
+    params_struct = jax.tree.map(ocp.utils.to_shape_dtype_struct, params)
+    # ckpt_struct = jax.tree.map(ocp.utils.to_shape_dtype_struct, ckpt_metadata.item_metadata.tree)
+    ckpt_struct = ckpt_metadata.item_metadata.tree
+
+    print("Validating params structure and checkpoint being loaded...\n")
+    is_valid = validate_checkpoint(params_struct, ckpt_struct)
+
+    if not is_valid:
+        if strict:
+            print_diff(params_struct, ckpt_struct)
+            raise RuntimeError(
+                "\nThe model structure does not match with the checkpoint being loaded!"
+            )
+        else:
+            print("Validation failed...")
+            raise RuntimeError(
+                "\nThe model structure does not match with the checkpoint being loaded!"
+            )
+
+    print(f"Restoring params from: {path}")
+    item, transforms = sharding, None
+    restore_args = jax.tree.map(lambda s: ocp.ArrayRestoreArgs(sharding=s), sharding)
+    with ocp.PyTreeCheckpointer() as ckptr:
+        return ckptr.restore(
+            path,
+            args=ocp.args.PyTreeRestore(
+                item=item, transforms=transforms, restore_args=restore_args
+            ),
+        )
+
+
 def load_optim_state_from_checkpoint(path, optim_state, mesh):
     """Load optimizer state from a given checkpoint.
 
@@ -121,7 +275,7 @@ def load_optim_state_from_checkpoint(path, optim_state, mesh):
     """
 
     print(f"Restoring optimizer state from checkpoint: {path}")
-    ioptim_item, optim_transforms = optim_state, None
+    optim_item, optim_transforms = optim_state, None
     optim_restore_args = jax.tree.map(
         lambda s: ocp.ArrayRestoreArgs(sharding=get_sharding_for_checkpoint(s, mesh)),
         optim_state,
