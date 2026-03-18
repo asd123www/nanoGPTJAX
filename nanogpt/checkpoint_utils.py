@@ -1,5 +1,4 @@
 import jax
-import grain
 import hashlib
 import orbax.checkpoint as ocp
 from jax.sharding import NamedSharding
@@ -38,6 +37,9 @@ def load_checkpoint(mngr, step, model, optim_state, mesh, ds_iter=None):
     Returns:
         Tuple of (Restored weights, restored optim_state, restored ds_iter)
     """
+
+    if ds_iter is not None:
+        import grain
 
     params_item, params_transforms = model, None
     optim_item, optim_transforms = optim_state, None
