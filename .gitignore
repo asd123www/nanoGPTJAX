@@ -4,6 +4,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# dataset
+nanogpt/fineweb10B/*
+
 # C extensions
 *.so
 

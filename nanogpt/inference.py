@@ -4,7 +4,6 @@ import dataclasses
 from functools import partial
 
 import jax
-import tiktoken
 import numpy as np
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -14,8 +13,7 @@ from kvcache import KVCache, count_left_padding, prepare_chunk
 from checkpoint_utils import load_weights_from_checkpoint_with_validation
 from config import ShardingRules, Config, BATCH_AXIS_NAME
 
-from sft_dataloader import build_tokenizer
-from sft_dataloader import format_conversation
+from tokenizer_utils import build_tokenizer
 
 
 def pad_tokens(tokens, pad_id, pad_to_power_of_two=False):
@@ -120,76 +118,6 @@ def generate(
     return generated_tokens
 
 
-# This version can be used when you want to put a certain stop condition (e.g. max_new_tokens)
-# or stop_token in the loop and break out of it ASAP. scan does not let you break out of the
-# loop, but while_loop does. Though it allows you to break out early, you will still be using
-# same amount of memory as in scan!
-@partial(jax.jit, static_argnames=("head_dim", "max_new_tokens", "temperature", "top_k", "stop_token_id"))  # fmt: off
-def generate_v2(
-    params,
-    cache,
-    last_token,
-    generated_tokens,
-    head_dim,
-    decode_key,
-    temperature,
-    top_k,
-    max_new_tokens,
-    stop_token_id,
-):
-    def cond_fn(state):
-        _, _, _, generated_tokens, step, finished = state
-        return (~finished) & (step < max_new_tokens)
-
-    def body_fn(state):
-        cache, last_token, decode_key, generated_tokens, step, finished = state
-        logits, cache = decode(params, last_token, cache, head_dim)
-        decode_key, sub = jax.random.split(decode_key)
-        token = sample_from_logits(logits, sub, temperature, top_k)
-        generated_tokens = generated_tokens.at[:, step].set(token)
-        finished = jnp.all(token == stop_token_id)
-        return (cache, token[:, None], decode_key, generated_tokens, step + 1, finished)
-
-    state = (
-        cache,
-        last_token,
-        decode_key,
-        generated_tokens,
-        jnp.int32(1),
-        jnp.bool_(False),
-    )
-    _, _, _, generated_tokens, _, _ = jax.lax.while_loop(cond_fn, body_fn, state)
-    return generated_tokens
-
-
-@partial(jax.jit, static_argnames=("temperature", "head_dim", "max_new_tokens", "top_k"))  # fmt: off
-def generate(
-    params,
-    cache,
-    last_token,
-    generated_tokens,
-    head_dim,
-    decode_key,
-    temperature,
-    top_k,
-    max_new_tokens,
-):
-    def decode_body(carry, t):
-        cache, last_token, decode_key, generated_tokens = carry
-        logits, cache = decode(params, last_token, cache, head_dim)
-        decode_key, sub = jax.random.split(decode_key)
-        token = sample_from_logits(logits, sub, temperature, top_k)
-        generated_tokens = generated_tokens.at[:, t].set(token)
-        return (cache, token[:, None], decode_key, generated_tokens), None
-
-    (cache, last_token, decode_key, generated_tokens), _ = jax.lax.scan(
-        decode_body,
-        (cache, last_token, decode_key, generated_tokens),
-        jnp.arange(1, max_new_tokens),
-    )
-    return generated_tokens
-
-
 if __name__ == "__main__":
     devices = np.array(jax.devices())
     print("Found devices: ", devices)
@@ -197,14 +125,6 @@ if __name__ == "__main__":
     mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
     sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
     cfg = Config(mesh=mesh, rules=sharding_rules)
-
-    # Although the model structure does not change between pretraining and SFT
-    # the performance of the model depends on the checkpoint being used. If you
-    # are testing for SFT, ensure you load the right checkpoint and test the model
-    # in the right way. A big difference between pretraining and SFT model is that
-    # the SFTed model would expect a chat_templated input(`format_conversation`
-    # function output in our case)
-    MODEL_TYPE = "pretrained"
 
     # Get the weight shardings
     print("Building GPT model based on the config...")
@@ -218,79 +138,29 @@ if __name__ == "__main__":
 
     tok_info = build_tokenizer()
     tokenizer = tok_info["tokenizer"]
-    user_start = tok_info["user_start"]
-    user_end = tok_info["user_end"]
-    assistant_start = tok_info["assistant_start"]
-    assistant_end = tok_info["assistant_end"]
-    pad_token = tok_info["pad_token"]
-    # custom_tokens = [user_start, user_end, assistant_start, assistant_end, pad_token]
-    custom_tokens = [t for t in tok_info["custom_token_ids"]]
-
-    BOS_ID = tok_info["bos_id"]
     PAD_ID = tok_info["pad_id"]
-    BOS = tok_info["bos"]
 
     head_dim = cfg.model.attn.head_dim
     max_new_tokens = 100
     top_k = 500
     temperature = 0.8
 
-    if MODEL_TYPE == "pretrained":
-        # Warmup the model with some fake inputs first
-        prompts = ["<|endoftext|>Did you hear the noise coming "] * len(devices)
-        encoded = tokenizer.encode_batch(prompts, allowed_special="all")
-        input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
-        key = jax.random.PRNGKey(123)
-        print("Warming up the model...")
+    # Warm up the compiler with a batch that matches the device count.
+    prompts = ["<|endoftext|>Did you hear the noise coming "] * len(devices)
+    encoded = tokenizer.encode_batch(prompts, allowed_special="all")
+    input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
+    key = jax.random.PRNGKey(123)
+    print("Warming up the model...")
 
-        # Set the cache
-        cache_key = jax.random.PRNGKey(1)
-        batch_size = input_ids.shape[0]
-        cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+    cache_key = jax.random.PRNGKey(1)
+    batch_size = input_ids.shape[0]
+    cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
 
-        # Always make the compiler aware of the mesh context
-        # so that it does not do stupid things by trying being
-        # more smart!
-        with jax.set_mesh(cfg.mesh):
-            key, subkey = jax.random.split(key)
-            _, next_tokens, temp_cache = prefill(
-                model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
-            )
-
-            generated_tokens = (
-                jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
-                .at[:, 0]
-                .set(next_tokens)
-            )
-            last_token = next_tokens[:, None]
-            generated = generate(
-                model,
-                temp_cache,
-                last_token,
-                generated_tokens,
-                head_dim,
-                subkey,
-                temperature=temperature,
-                top_k=top_k,
-                max_new_tokens=max_new_tokens,
-            )
-        print("Warming up complete!\nGenerating...")
-
-        prompts = [
-            "<|endoftext|>Did you notice that this world",
-            "<|endoftext|>Hello World! My dear",
-            "<|endoftext|>Some say we are tired far",
-            "<|endoftext|>Hear that?",
-        ]
-        encoded = tokenizer.encode_batch(prompts, allowed_special="all")
-        input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
+    with jax.set_mesh(cfg.mesh):
         key, subkey = jax.random.split(key)
-
-        start = time.perf_counter()
-        with jax.set_mesh(cfg.mesh):
-            _, next_tokens, cache = prefill(
-                model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
-            )
+        _, next_tokens, cache = prefill(
+            model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
+        )
 
         generated_tokens = (
             jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
@@ -298,75 +168,63 @@ if __name__ == "__main__":
             .set(next_tokens)
         )
         last_token = next_tokens[:, None]
-
-        with jax.set_mesh(cfg.mesh):
-            generated = generate(
-                model,
-                temp_cache,
-                last_token,
-                generated_tokens,
-                head_dim,
-                subkey,
-                temperature=temperature,
-                top_k=top_k,
-                max_new_tokens=max_new_tokens,
-            )
-        end = time.perf_counter()
-        print(
-            f"Time taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start):.2f} seconds"
+        warmup_generated = generate(
+            model,
+            cache,
+            last_token,
+            generated_tokens,
+            head_dim,
+            subkey,
+            temperature=temperature,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens,
         )
-        decoded = tokenizer.decode_batch(generated.tolist())
+        jax.block_until_ready(warmup_generated)
+    print("Warming up complete!\nGenerating...")
 
-    elif MODEL_TYPE == "SFT":
-        examples = {
-            "messages": [
-                {
-                    "content": 'What are the benefits of regular exercise? Your response should contain at least 3 sentences. Include keywords such as "health", "reduce", and "improve".\n',
-                    "role": "user",
-                },
-            ],
-        }
-        prompts = [
-            format_conversation(ex, tok_info)["text"] + assistant_start
-            for ex in examples
-        ]
-        encoded = tokenizer.encode_batch(prompts, allowed_special="all")
-        input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
-        # Set the cache
-        cache_key = jax.random.PRNGKey(1)
-        batch_size = input_ids.shape[0]
-        cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+    prompt_pool = [
+        "<|endoftext|>Did you notice that this world",
+        "<|endoftext|>Hello World! My dear",
+        "<|endoftext|>Some say we are tired far",
+        "<|endoftext|>Hear that?",
+    ]
+    prompts = (prompt_pool * math.ceil(len(devices) / len(prompt_pool)))[: len(devices)]
+    encoded = tokenizer.encode_batch(prompts, allowed_special="all")
+    input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
+    batch_size = input_ids.shape[0]
+    cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+    key, subkey = jax.random.split(key)
 
-        key = jax.random.PRNGKey(123)
-        key, subkey = jax.random.split(key)
-
-        with jax.set_mesh(cfg.mesh):
-            _, next_tokens, cache = prefill(
-                model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
-            )
-
-        generated_tokens = (
-            jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
-            .at[:, 0]
-            .set(next_tokens)
+    start = time.perf_counter()
+    with jax.set_mesh(cfg.mesh):
+        _, next_tokens, cache = prefill(
+            model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
         )
-        last_token = next_tokens[:, None]
 
-        with jax.set_mesh(cfg.mesh):
-            generated = generate_v2(
-                model,
-                cache,
-                last_token,
-                generated_tokens,
-                head_dim,
-                subkey,
-                temperature=temperature,
-                top_k=top_k,
-                max_new_tokens=max_new_tokens,
-                stop_token_id=tok_info["assistant_end_id"],
-            )
+    generated_tokens = (
+        jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
+        .at[:, 0]
+        .set(next_tokens)
+    )
+    last_token = next_tokens[:, None]
 
-        decoded = tokenizer.decode_batch(generated.tolist())
+    with jax.set_mesh(cfg.mesh):
+        generated = generate(
+            model,
+            cache,
+            last_token,
+            generated_tokens,
+            head_dim,
+            subkey,
+            temperature=temperature,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens,
+        )
+    end = time.perf_counter()
+    print(
+        f"Time taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start):.2f} seconds"
+    )
+    decoded = tokenizer.decode_batch(generated.tolist())
 
     for p, d in zip(prompts, decoded):
         print(f"Prompt: {p}")

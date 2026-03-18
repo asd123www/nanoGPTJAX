@@ -270,4 +270,4 @@ class Config:
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     hparams: HyperParams = dataclasses.field(default_factory=HyperParams)
     ckpt_cfg: CheckpointConfig = dataclasses.field(default_factory=CheckpointConfig)
-    data_dir: Path | str = None
+    data_dir: Path | str = "/home/zezhou/nanoGPTJAX/nanogpt/fineweb10B/"
