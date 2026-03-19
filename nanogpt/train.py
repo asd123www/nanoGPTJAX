@@ -1,25 +1,4 @@
 import os
-
-# Set some GPU FLAGS
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-os.environ["NCCL_NVLS_ENABLE"] = "1"
-os.environ.update(
-    {
-        "NCCL_LL128_BUFFSIZE": "-2",
-        "NCCL_LL_BUFFSIZE": "-2",
-        "NCCL_PROTO": "SIMPLE,LL,LL128",
-    }
-)
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_triton_gemm_any=True "
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_enable_pipelined_all_reduce=true "
-    "--xla_gpu_enable_pipelined_all_gather=true "
-    "--xla_gpu_enable_pipelined_reduce_scatter=true "
-    "--xla_gpu_enable_while_loop_double_buffering=true "
-    "--xla_gpu_enable_pipelined_p2p=true "
-    "--xla_gpu_collective_permute_decomposer_threshold=1024 "
-)
 import warnings
 import logging
 import time
@@ -27,9 +6,6 @@ from pathlib import Path
 from functools import partial
 
 import jax
-
-jax.config.update("jax_optimization_level", "O1")
-
 import optax
 import grain
 import numpy as np
@@ -160,6 +136,47 @@ def get_next_batch(
         return x, y
 
 
+def build_optim(model, cfg, grad_accum_steps):
+    optim = optax.chain(
+        optax.clip_by_global_norm(cfg.hparams.grad_clip_norm),
+        build_optimizer(
+            model,
+            d_model=cfg.model.d_emb,
+            other_peak_lr=cfg.hparams.max_lr,
+            other_min_lr=cfg.hparams.min_lr,
+            total_train_steps=cfg.hparams.total_train_steps,
+            warmup_steps=cfg.hparams.warmup_steps,
+            b1=cfg.hparams.b1,
+            b2=cfg.hparams.b2,
+            embedding_lr=cfg.hparams.embedding_lr,
+            weight_decay=cfg.hparams.weight_decay,
+            cautious_weight_decay=cfg.hparams.cautious_weight_decay,
+        ),
+    )
+    if grad_accum_steps > 1:
+        print("Using `MultiSteps` in optax for gradient accumulation...")
+        optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
+    optim_state = optim.init(model)
+    return optim, optim_state
+
+
+def build_checkpoint_manager(cfg):
+    ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir).resolve()
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=cfg.ckpt_cfg.max_checkpoints_to_keep,
+        save_interval_steps=cfg.ckpt_cfg.checkpoint_save_steps,
+        enable_async_checkpointing=True,
+        enable_background_delete=True,
+    )
+    handlers = {
+        "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
+        "optim_state": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
+        "ds": ocp.Checkpointer(grain.checkpoint.CheckpointHandler()),
+    }
+    mngr = ocp.CheckpointManager(ckpt_path, handlers, options=options)
+    return ckpt_path, mngr
+
+
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="Train a GPT model")
@@ -169,7 +186,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+if __name__ == "__main__":
     args = parse_args()
 
     # Data parallel: sharding along the batch axis.
@@ -200,85 +217,18 @@ def main():
     data_accum_sharding = logical_to_sharding((None, "batch", None), cfg.mesh, cfg.rules)
 
     seqlen = cfg.model.seqlen
-    max_lr = cfg.hparams.max_lr
-    min_lr = cfg.hparams.min_lr
-    warmup_steps = cfg.hparams.warmup_steps
     total_train_steps = cfg.hparams.total_train_steps
-    max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
     checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
 
-    # Load the model
+    # Model, optimizer, and checkpointing
     print("Building GPT model based on the config...")
     model = GPT.init(jax.random.PRNGKey(0), cfg)
     print("Model built successfully!")
+    optim, optim_state = build_optim(model, cfg, grad_accum_steps)
+    ckpt_path, mngr = build_checkpoint_manager(cfg)
 
-    # Optimizer
-    optim = optax.chain(
-        optax.clip_by_global_norm(cfg.hparams.grad_clip_norm),
-        build_optimizer(
-            model,
-            d_model=cfg.model.d_emb,
-            other_peak_lr=max_lr,
-            other_min_lr=min_lr,
-            total_train_steps=total_train_steps,
-            warmup_steps=warmup_steps,
-            b1=cfg.hparams.b1,
-            b2=cfg.hparams.b2,
-            embedding_lr=cfg.hparams.embedding_lr,
-            weight_decay=cfg.hparams.weight_decay,
-            cautious_weight_decay=cfg.hparams.cautious_weight_decay,
-        ),
-    )
-
-    if grad_accum_steps > 1:
-        print("Using `MultiSteps` in optax for gradient accumulation...")
-        optim = optax.MultiSteps(optim, every_k_schedule=grad_accum_steps)
-
-    optim_state = optim.init(model)
-
-    # Checkpointing
-    ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir).resolve()
-    options = ocp.CheckpointManagerOptions(
-        max_to_keep=max_checkpoints_to_keep,
-        save_interval_steps=checkpoint_save_steps,
-        enable_async_checkpointing=True,
-        enable_background_delete=True,
-    )
-    handlers = {
-        "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
-        "optim_state": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
-        "ds": ocp.Checkpointer(grain.checkpoint.CheckpointHandler()),
-    }
-
-    mngr = ocp.CheckpointManager(ckpt_path, handlers, options=options)
-
-    print("")
-    print("-" * 75)
-    print("")
-
-    print(line("Number of trainable params: ", count_params(model), comma=True))
-    print(line("Sequence length per sample", seqlen))
-    print(line("Per device batch size", micro_batch_size))
-    print(line("Global batch size", global_batch_size))
-    print(line("Grad accumulation steps", grad_accum_steps))
-    print()
-    print(line("LR (min, max)", str((min_lr, max_lr))))
-    print(line("Warmup steps", cfg.hparams.warmup_steps))
-    print(line("Weight decay", cfg.hparams.weight_decay), "\n")
-    print("-" * 75)
-
-    # Compute the frequencies
-    positions = jnp.arange(seqlen)[None, :]
-    with set_mesh(cfg.mesh):
-        head_dim = cfg.model.attn.head_dim
-        freqs = precompute_frequencies(positions=positions, features=head_dim)
-
-    # Because our dataloader already ensures that sequence in a batch have
-    # tokens equal to the context window, we do not need sequence packing here
-    # Hence, we can segment_ids to None for pretraining.
-    segment_ids = None
+    # Resume from checkpoint if available
     resume_from_step = cfg.ckpt_cfg.last_checkpoint_step
-
     if resume_from_step > 0:
         resume_ckpt_path = os.path.join(
             str(ckpt_path), str(resume_from_step)
@@ -295,6 +245,25 @@ def main():
                 f"Checkpoint path {resume_ckpt_path} not found! Resuming training without restoring checkpoint..."
             )
 
+    # Print the configuration summary
+    print("\n" + "-" * 75 + "\n")
+    print(line("Number of trainable params", count_params(model), comma=True))
+    print(line("Sequence length per sample", cfg.model.seqlen))
+    print(line("Micro batch size", cfg.hparams.micro_batch_size))
+    print(line("Global batch size", cfg.hparams.global_batch_size))
+    print(line("Grad accumulation steps", grad_accum_steps), "\n")
+    print(line("LR (min, max)", str((cfg.hparams.min_lr, cfg.hparams.max_lr))))
+    print(line("Warmup steps", cfg.hparams.warmup_steps))
+    print(line("Weight decay", cfg.hparams.weight_decay), "\n")
+    print("\n" + "-" * 75 + "\n")
+
+    # Compute the frequencies
+    positions = jnp.arange(seqlen)[None, :]
+    with set_mesh(cfg.mesh):
+        head_dim = cfg.model.attn.head_dim
+        freqs = precompute_frequencies(positions=positions, features=head_dim)
+
+    segment_ids = None
     best_loss = float("inf")
     last_val_loss = float("inf")
     es_patience = cfg.hparams.es_patience
@@ -382,7 +351,7 @@ def main():
 
                     step += 1
 
-                    if (step % options.save_interval_steps) == 0:
+                    if (step % checkpoint_save_steps) == 0:
                         mngr.save(
                             step,
                             args=ocp.args.Composite(
@@ -479,7 +448,3 @@ def main():
     print(
         f"\nTotal time taken to train the model: {(train_end_time - train_start_time) / 60:.2f} minutes"
     )
-
-
-if __name__ == "__main__":
-    main()

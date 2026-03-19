@@ -35,9 +35,9 @@ hparams:
 
 checkpoint:
   max_checkpoints_to_keep: 3
-  checkpoint_save_steps: 200
-  last_checkpoint_step: 0
+  checkpoint_save_steps: 20
+  last_checkpoint_step: 880
   save_ckpt_dir: "checkpoints/small"
-  load_params_ckpt_path: "checkpoints/small/2800/params"
+  load_params_ckpt_path: "checkpoints/small/880/params"
 
 data_dir: "nanogpt/fineweb10B/"
