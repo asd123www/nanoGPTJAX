@@ -1,6 +1,7 @@
 import time
 import math
 import dataclasses
+from pathlib import Path
 from functools import partial
 
 import jax
@@ -41,6 +42,9 @@ def prefill(params, input_ids, segment_ids, cache, head_dim, pad_id):
 
     With left padding, starts[b] = count of left pad tokens for sequence b.
     After prefill, cache.iter = seq_len % cache.size (same for all sequences due to alignment).
+
+    Returns the logits at the last position (for sampling the first generated
+    token externally) and the updated cache.
     """
 
     left_pad_counts = count_left_padding(input_ids, pad_id=pad_id)
@@ -48,8 +52,7 @@ def prefill(params, input_ids, segment_ids, cache, head_dim, pad_id):
     cache = dataclasses.replace(cache, starts=left_pad_counts, iter=uninitialized_iter)
     logits, cache = forward_v2(params, input_ids, segment_ids, cache, head_dim)
     last_token_logits = logits[:, -1, :]
-    next_tokens = jnp.argmax(last_token_logits, axis=-1)
-    return logits, next_tokens, cache
+    return last_token_logits, cache
 
 
 def decode(params, input_ids, cache, head_dim):
@@ -144,8 +147,9 @@ if __name__ == "__main__":
     model = GPT.init(jax.random.PRNGKey(0), cfg)
     model_sharding = GPT.shardings(cfg.mesh, cfg.rules, cfg.model)
     print("Model built successfully!\n")
+    ckpt_params_path = str(Path(cfg.ckpt_cfg.load_params_ckpt_path).resolve())
     model = load_weights_from_checkpoint_with_validation(
-        cfg.ckpt_cfg.load_params_ckpt_path, model, model_sharding
+        ckpt_params_path, model, model_sharding
     )
     print("Weights loaded from the checkpoint successfully!")
 
@@ -161,7 +165,7 @@ if __name__ == "__main__":
     # Warm up the compiler with a batch that matches the device count.
     prompts = ["<|endoftext|>Did you hear the noise coming "] * len(devices)
     encoded = tokenizer.encode_batch(prompts, allowed_special="all")
-    input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
+    input_ids, segment_ids = pad_tokens(encoded, PAD_ID, pad_to_power_of_two=True)
     key = jax.random.PRNGKey(123)
     print("Warming up the model...")
 
@@ -170,10 +174,11 @@ if __name__ == "__main__":
     cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
 
     with jax.set_mesh(cfg.mesh):
-        key, subkey = jax.random.split(key)
-        _, next_tokens, cache = prefill(
+        key, prefill_key, decode_key = jax.random.split(key, 3)
+        last_token_logits, cache = prefill(
             model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
         )
+        next_tokens = sample_from_logits(last_token_logits, prefill_key, temperature, top_k)
 
         generated_tokens = (
             jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
@@ -187,59 +192,71 @@ if __name__ == "__main__":
             last_token,
             generated_tokens,
             head_dim,
-            subkey,
+            decode_key,
             temperature=temperature,
             top_k=top_k,
             max_new_tokens=max_new_tokens,
         )
         jax.block_until_ready(warmup_generated)
-    print("Warming up complete!\nGenerating...")
+    print("Warming up complete!")
+    print("=" * 60)
+    print("Interactive generation mode. Type your prompt and press Enter.")
+    print("Type 'quit' or 'exit' to stop. Press Ctrl+C to abort.\n")
 
-    prompt_pool = [
-        "<|endoftext|>Did you notice that this world",
-        "<|endoftext|>Hello World! My dear",
-        "<|endoftext|>Some say we are tired far",
-        "<|endoftext|>Hear that?",
-    ]
-    prompts = (prompt_pool * math.ceil(len(devices) / len(prompt_pool)))[: len(devices)]
-    encoded = tokenizer.encode_batch(prompts, allowed_special="all")
-    input_ids, segment_ids = pad_tokens(encoded, pad_to_power_of_two=True)
-    batch_size = input_ids.shape[0]
-    cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
-    key, subkey = jax.random.split(key)
+    BOS = "<|endoftext|>"
+    num_devices = len(devices)
 
-    start = time.perf_counter()
-    with jax.set_mesh(cfg.mesh):
-        _, next_tokens, cache = prefill(
-            model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
+    while True:
+        try:
+            user_input = input(">>> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if user_input.strip().lower() in ("quit", "exit"):
+            print("Exiting.")
+            break
+
+        if not user_input.strip():
+            continue
+
+        prompt = BOS + user_input
+        prompts = [prompt] * num_devices
+        encoded = tokenizer.encode_batch(prompts, allowed_special="all")
+        input_ids, segment_ids = pad_tokens(encoded, PAD_ID, pad_to_power_of_two=True)
+        batch_size = input_ids.shape[0]
+        cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+        key, prefill_key, decode_key = jax.random.split(key, 3)
+
+        start = time.perf_counter()
+        with jax.set_mesh(cfg.mesh):
+            last_token_logits, cache = prefill(
+                model, input_ids, segment_ids, cache, head_dim, pad_id=PAD_ID
+            )
+            next_tokens = sample_from_logits(last_token_logits, prefill_key, temperature, top_k)
+
+        generated_tokens = (
+            jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
+            .at[:, 0]
+            .set(next_tokens)
         )
+        last_token = next_tokens[:, None]
 
-    generated_tokens = (
-        jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)
-        .at[:, 0]
-        .set(next_tokens)
-    )
-    last_token = next_tokens[:, None]
+        with jax.set_mesh(cfg.mesh):
+            generated = generate(
+                model,
+                cache,
+                last_token,
+                generated_tokens,
+                head_dim,
+                decode_key,
+                temperature=temperature,
+                top_k=top_k,
+                max_new_tokens=max_new_tokens,
+            )
+        elapsed = time.perf_counter() - start
 
-    with jax.set_mesh(cfg.mesh):
-        generated = generate(
-            model,
-            cache,
-            last_token,
-            generated_tokens,
-            head_dim,
-            subkey,
-            temperature=temperature,
-            top_k=top_k,
-            max_new_tokens=max_new_tokens,
-        )
-    end = time.perf_counter()
-    print(
-        f"Time taken to generate {max_new_tokens * len(prompts)} tokens: {(end - start):.2f} seconds"
-    )
-    decoded = tokenizer.decode_batch(generated.tolist())
-
-    for p, d in zip(prompts, decoded):
-        print(f"Prompt: {p}")
-        print(f"Completion: {d}")
-        print("-" * 75)
+        completion = tokenizer.decode(generated[0].tolist())
+        print(f"\n{completion}")
+        print(f"\n[{max_new_tokens} tokens in {elapsed:.2f}s | {max_new_tokens / elapsed:.1f} tok/s]")
+        print("-" * 60)
