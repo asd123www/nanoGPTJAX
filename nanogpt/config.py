@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import yaml
 import dataclasses
 from pathlib import Path
 from typing import Callable, Tuple, Optional
@@ -179,6 +180,7 @@ class ModelConfig:
                 d_emb=self.d_emb,
                 q_heads=self.q_heads,
                 kv_heads=self.kv_heads,
+                num_layers=self.num_layers,
             )
         self.mlp = MLPConfig(dtype=self.dtype, d_emb=self.d_emb)
         self.lm_head = LinearConfig(
@@ -262,6 +264,73 @@ class HyperParams:
     val_interval: int = 50
     
 
+DTYPE_MAP = {
+    "float32": jnp.float32,
+    "float16": jnp.float16,
+    "bfloat16": jnp.bfloat16,
+}
+
+
+def _dtype_from_str(s: str) -> jnp.dtype:
+    if s not in DTYPE_MAP:
+        raise ValueError(f"Unsupported dtype '{s}'. Choose from {list(DTYPE_MAP)}")
+    return DTYPE_MAP[s]
+
+
+def _build_model_config(d: dict) -> "ModelConfig":
+    d = dict(d)
+    if "dtype" in d:
+        d["dtype"] = _dtype_from_str(d["dtype"])
+    return ModelConfig(**d)
+
+
+def _build_hparams(d: dict) -> "HyperParams":
+    d = dict(d)
+    return HyperParams(**d)
+
+
+def _build_checkpoint_config(d: dict) -> "CheckpointConfig":
+    d = dict(d)
+    return CheckpointConfig(**d)
+
+
+def load_config_from_yaml(
+    path: str | Path,
+    *,
+    mesh: Mesh = None,
+    rules: "ShardingRules" = None,
+    seed: jax.Array = None,
+) -> "Config":
+    """Build a Config from a YAML file.
+
+    The YAML file is expected to have top-level keys matching the Config
+    sub-configs: ``model``, ``hparams``, ``checkpoint``, and optionally
+    ``data_dir``.  Runtime objects (mesh, rules, seed) are passed as
+    keyword arguments since they cannot be serialized.
+    """
+    path = Path(path)
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+
+    model_cfg = _build_model_config(raw.get("model", {}))
+    hparams = _build_hparams(raw.get("hparams", {}))
+    ckpt_cfg = _build_checkpoint_config(raw.get("checkpoint", {}))
+    data_dir = raw.get("data_dir", "")
+
+    if rules is None:
+        rules = ShardingRules()
+
+    return Config(
+        seed=seed,
+        mesh=mesh,
+        rules=rules,
+        model=model_cfg,
+        hparams=hparams,
+        ckpt_cfg=ckpt_cfg,
+        data_dir=data_dir,
+    )
+
+
 @jax_pytree_struct
 class Config:
     seed: jax.Array = None
@@ -270,4 +339,4 @@ class Config:
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     hparams: HyperParams = dataclasses.field(default_factory=HyperParams)
     ckpt_cfg: CheckpointConfig = dataclasses.field(default_factory=CheckpointConfig)
-    data_dir: Path | str = "/home/zezhou/nanoGPTJAX/nanogpt/fineweb10B/"
+    data_dir: Path | str = ""
