@@ -1,0 +1,49 @@
+# Default configuration for nanoGPT-JAX
+# This matches the hardcoded defaults in config.py
+
+model:
+  seqlen: 2048
+  vocab_size: 50304
+  d_emb: 768
+  num_layers: 16
+  q_heads: 8
+  kv_heads: 4
+  attn_type: gqa       # "gqa" or "mha"
+  dtype: bfloat16
+
+hparams:
+  per_device_batch_size: 32
+  desired_batch_size: 524288
+
+  # Optimizer
+  max_lr: 6.0e-4
+  min_lr: 6.0e-5
+  embedding_lr: 0.2
+  unembedding_lr: 0.004
+  other_peak_lr: 0.02
+  b1: 0.8
+  b2: 0.95
+  weight_decay: 0.0
+  cautious_weight_decay: 0.01
+  grad_clip_norm: 1.0
+
+  # Schedule
+  total_train_steps: 10000
+  warmup_steps: 300
+
+  # For midtraining and SFT
+  init_lr_frac: 0.2
+  final_lr_frac: 0.0
+
+  # Validation / early stopping
+  es_patience: 500
+  val_interval: 50
+
+checkpoint:
+  max_checkpoints_to_keep: 5
+  checkpoint_save_steps: 100
+  last_checkpoint_step: 0
+  save_ckpt_dir: ""
+  load_params_ckpt_path: ""
+
+data_dir: "/home/zezhou/nanoGPTJAX/nanogpt/fineweb10B/"

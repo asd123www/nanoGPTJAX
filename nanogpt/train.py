@@ -44,7 +44,7 @@ from model import precompute_frequencies
 from model import GPT, forward
 from utils import logical_to_sharding
 from optim import build_optimizer
-from config import ShardingRules, Config, BATCH_AXIS_NAME
+from config import ShardingRules, Config, BATCH_AXIS_NAME, load_config_from_yaml
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
 
 
@@ -160,13 +160,26 @@ def get_next_batch(
         return x, y
 
 
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train a GPT model")
+    parser.add_argument(
+        "--config", type=str, default="configs/default.yaml", help="Path to a YAML configuration file (e.g. configs/default.yaml)",
+    )
+    return parser.parse_args()
+
+
 def main():
-    # Get the mesh, sharding rules, amd the config
+    args = parse_args()
+
+    # Get the mesh, sharding rules, and the config
     devices = np.array(jax.devices())
     print("Number of devices found:", len(devices))
     mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
     sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
-    cfg = Config(mesh=mesh, rules=sharding_rules)
+
+    print(f"Loading configuration from: {args.config}")
+    cfg = load_config_from_yaml(args.config, mesh=mesh, rules=sharding_rules)
 
     train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
     val_files = list(Path(cfg.data_dir).glob("*val*.bin"))
@@ -175,12 +188,8 @@ def main():
     print("\nNumber of train files found: ", num_train_files)
     print("Number of validation files found: ", num_val_files)
 
-    train_dl = make_grain_shard_loader(
-        train_files, prefetch=16, num_threads=32, prefetch_buffer_size=16
-    )
-    val_dl = make_grain_shard_loader(
-        val_files, prefetch=0, num_threads=16, prefetch_buffer_size=16
-    )
+    train_dl = make_grain_shard_loader(train_files)
+    val_dl = make_grain_shard_loader(val_files)
     train_iter = iter(train_dl)
 
     per_device_bsz = cfg.hparams.per_device_batch_size

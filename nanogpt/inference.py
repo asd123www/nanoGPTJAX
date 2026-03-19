@@ -11,7 +11,7 @@ from jax.sharding import Mesh
 from model import GPT, forward_v2
 from kvcache import KVCache, count_left_padding, prepare_chunk
 from checkpoint_utils import load_weights_from_checkpoint_with_validation
-from config import ShardingRules, Config, BATCH_AXIS_NAME
+from config import ShardingRules, Config, BATCH_AXIS_NAME, load_config_from_yaml
 
 from tokenizer_utils import build_tokenizer
 
@@ -119,12 +119,25 @@ def generate(
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Run GPT inference")
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a YAML configuration file (e.g. configs/default.yaml)",
+    )
+    cli_args = parser.parse_args()
+
     devices = np.array(jax.devices())
     print("Found devices: ", devices)
     print("Platform: ", devices[0].platform)
     mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
     sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
-    cfg = Config(mesh=mesh, rules=sharding_rules)
+
+    if cli_args.config is not None:
+        print(f"Loading configuration from: {cli_args.config}")
+        cfg = load_config_from_yaml(cli_args.config, mesh=mesh, rules=sharding_rules)
+    else:
+        cfg = Config(mesh=mesh, rules=sharding_rules)
 
     # Get the weight shardings
     print("Building GPT model based on the config...")
