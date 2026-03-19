@@ -240,7 +240,7 @@ def main():
     optim_state = optim.init(model)
 
     # Checkpointing
-    ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir)
+    ckpt_path = Path(cfg.ckpt_cfg.save_ckpt_dir).resolve()
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_checkpoints_to_keep,
         save_interval_steps=checkpoint_save_steps,
@@ -283,7 +283,7 @@ def main():
 
     if resume_from_step > 0:
         resume_ckpt_path = os.path.join(
-            cfg.ckpt_cfg.save_ckpt_dir, str(resume_from_step)
+            str(ckpt_path), str(resume_from_step)
         )
         if os.path.exists(resume_ckpt_path):
             from checkpoint_utils import load_checkpoint
@@ -450,7 +450,7 @@ def main():
                                 val_loss += loss.item()
                                 val_steps_count += 1
                         finally:
-                            val_tokens.unlink_on_del()
+                            del val_tokens
                     avg_val_loss = val_loss / val_steps_count
                     avg_val_loss = jax.block_until_ready(avg_val_loss)
                     improved = avg_val_loss < best_loss
@@ -476,7 +476,7 @@ def main():
                     print(f"Best loss     : {best_loss:.4f} at step {best_step}\n")
                     last_val_loss = avg_val_loss
         finally:
-            tokens.unlink_on_del()
+            del tokens
     train_end_time = time.time()
     print(
         f"\nTotal time taken to train the model: {(train_end_time - train_start_time) / 60:.2f} minutes"

@@ -1,12 +1,12 @@
-# Small model configuration for quick experiments / debugging
+# Small model for single TPU v5e chip.
 
 model:
-  seqlen: 512
+  seqlen: 1024
   vocab_size: 50304
-  d_emb: 384
-  num_layers: 6
-  q_heads: 6
-  kv_heads: 3
+  d_emb: 768
+  num_layers: 12
+  q_heads: 8
+  kv_heads: 4
   attn_type: gqa
   dtype: bfloat16
 
@@ -37,8 +37,8 @@ hparams:
 checkpoint:
   max_checkpoints_to_keep: 3
   checkpoint_save_steps: 200
-  last_checkpoint_step: 0
-  save_ckpt_dir: ""
-  load_params_ckpt_path: ""
+  last_checkpoint_step: 800
+  save_ckpt_dir: "checkpoints/small"
+  load_params_ckpt_path: "checkpoints/small/800/params"
 
 data_dir: "/home/zezhou/nanoGPTJAX/nanogpt/fineweb10B/"
