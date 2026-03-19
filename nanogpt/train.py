@@ -172,40 +172,37 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Get the mesh, sharding rules, and the config
+    # Data parallel: sharding along the batch axis.
     devices = np.array(jax.devices())
-    print("Number of devices found:", len(devices))
-    mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
-    sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
-
-    print(f"Loading configuration from: {args.config}")
+    mesh = Mesh(devices, ("batch"))
+    sharding_rules = ShardingRules(batch="batch")
     cfg = load_config_from_yaml(args.config, mesh=mesh, rules=sharding_rules)
 
+    # Prepare the data loaders.
     train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
     val_files = list(Path(cfg.data_dir).glob("*val*.bin"))
     num_train_files = len(train_files)
     num_val_files = len(val_files)
-    print("\nNumber of train files found: ", num_train_files)
-    print("Number of validation files found: ", num_val_files)
-
     train_dl = make_grain_shard_loader(train_files)
     val_dl = make_grain_shard_loader(val_files)
     train_iter = iter(train_dl)
+    print("[Data Loader]: Number of train files found: ", num_train_files)
+    print("[Data Loader]: Number of validation files found: ", num_val_files, "\n")
 
-    per_device_bsz = cfg.hparams.per_device_batch_size
-    bsz = per_device_bsz * len(devices)
-    seqlen = cfg.model.seqlen
-    head_dim = cfg.model.attn.head_dim
+    micro_batch_size = cfg.hparams.micro_batch_size
+    step_batch_size = micro_batch_size * mesh.shape["batch"]
+    global_batch_size = cfg.hparams.global_batch_size
+    assert global_batch_size % step_batch_size == 0, "Global batch size must be divisible by step batch size"
+    grad_accum_steps = global_batch_size // step_batch_size
+
+    # ToDo: what is this for?
     data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
-    data_accum_sharding = logical_to_sharding(
-        (None, "batch", None), cfg.mesh, cfg.rules
-    )
+    data_accum_sharding = logical_to_sharding((None, "batch", None), cfg.mesh, cfg.rules)
 
+    seqlen = cfg.model.seqlen
     max_lr = cfg.hparams.max_lr
-    min_lr = 0.01 * max_lr
+    min_lr = cfg.hparams.min_lr
     warmup_steps = cfg.hparams.warmup_steps
-    desired_batch_size = cfg.hparams.desired_batch_size
-    grad_accum_steps = max(2, desired_batch_size // (bsz * seqlen))
     total_train_steps = cfg.hparams.total_train_steps
     max_checkpoints_to_keep = cfg.ckpt_cfg.max_checkpoints_to_keep
     checkpoint_save_steps = cfg.ckpt_cfg.checkpoint_save_steps
@@ -261,8 +258,8 @@ def main():
 
     print(line("Number of trainable params: ", count_params(model), comma=True))
     print(line("Sequence length per sample", seqlen))
-    print(line("Per device batch size", per_device_bsz))
-    print(line("Total batch size", bsz))
+    print(line("Per device batch size", micro_batch_size))
+    print(line("Global batch size", global_batch_size))
     print(line("Grad accumulation steps", grad_accum_steps))
     print()
     print(line("LR (min, max)", str((min_lr, max_lr))))
@@ -273,6 +270,7 @@ def main():
     # Compute the frequencies
     positions = jnp.arange(seqlen)[None, :]
     with set_mesh(cfg.mesh):
+        head_dim = cfg.model.attn.head_dim
         freqs = precompute_frequencies(positions=positions, features=head_dim)
 
     # Because our dataloader already ensures that sequence in a batch have
@@ -306,8 +304,8 @@ def main():
     total_tokens_consumed = 0
 
     # Reusable data buffers
-    grad_accum_batch = np.zeros((grad_accum_steps, bsz, seqlen + 1), dtype=np.uint16)
-    val_data_buf = np.zeros((bsz, seqlen + 1), dtype=np.uint16)
+    grad_accum_batch = np.zeros((grad_accum_steps, step_batch_size, seqlen + 1), dtype=np.uint16)
+    val_data_buf = np.zeros((step_batch_size, seqlen + 1), dtype=np.uint16)
 
     step = resume_from_step
     print("Starting training (the first step will take some time for compilation...)\n")
@@ -334,7 +332,7 @@ def main():
             shard_processed_fully = False
 
             # build the static index once per shard (on-demand)
-            num_batches_in_shard = bf.build(bsz, seqlen)
+            num_batches_in_shard = bf.build(step_batch_size, seqlen)
             print(f"\n=== Processing Shard: {num_shards_used} with name: {shard_name}", end=" | ")  # fmt: off
             print(f"Indexed {num_batches_in_shard} batches ===")
 
@@ -342,11 +340,11 @@ def main():
                 try:
                     start = time.time()
                     for micro_step in range(grad_accum_steps):
-                        starts, ends = bf.next_batch(bsz, seqlen)
+                        starts, ends = bf.next_batch(step_batch_size, seqlen)
                         get_next_batch(
                             starts,
                             ends,
-                            bsz,
+                            step_batch_size,
                             seqlen,
                             tokens,
                             data_accum_sharding,
@@ -374,7 +372,7 @@ def main():
                     end = time.time()
                     dt = end - start
                     train_time_elapsed = (end - train_start_time) / 60  # in minutes
-                    tokens_processed = bsz * seqlen * grad_accum_steps
+                    tokens_processed = step_batch_size * seqlen * grad_accum_steps
                     total_tokens_consumed += tokens_processed
                     tokens_per_sec = int(tokens_processed / dt)
 
@@ -425,16 +423,16 @@ def main():
                             val_bf.bos_idx = val_shard["bos_idx"]
                             val_bf.size = val_shard["size"]
 
-                            num_val_batches = val_bf.build(bsz, seqlen)
+                            num_val_batches = val_bf.build(step_batch_size, seqlen)
                             if num_val_batches <= 0:
                                 continue
 
                             for _ in range(num_val_batches):
-                                starts, ends = val_bf.next_batch(bsz, seqlen)
+                                starts, ends = val_bf.next_batch(step_batch_size, seqlen)
                                 get_next_batch(
                                     starts,
                                     ends,
-                                    bsz,
+                                    step_batch_size,
                                     seqlen,
                                     val_tokens,
                                     data_sharding,

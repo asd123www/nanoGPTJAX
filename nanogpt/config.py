@@ -236,8 +236,8 @@ class CheckpointConfig:
 @dataclasses.dataclass
 class HyperParams:
     # Batch size related
-    per_device_batch_size: int = 32
-    desired_batch_size: int = 524288
+    micro_batch_size: int = 32
+    global_batch_size: int = 256
     grad_accum_steps: Optional[float] = dataclasses.field(init=False)
 
     # Optimizer related

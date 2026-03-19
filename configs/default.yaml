@@ -12,8 +12,8 @@ model:
   dtype: bfloat16
 
 hparams:
-  per_device_batch_size: 32
-  desired_batch_size: 524288
+  micro_batch_size: 32
+  global_batch_size: 256
 
   # Optimizer
   max_lr: 6.0e-4
@@ -46,4 +46,4 @@ checkpoint:
   save_ckpt_dir: ""
   load_params_ckpt_path: ""
 
-data_dir: "/home/zezhou/nanoGPTJAX/nanogpt/fineweb10B/"
+data_dir: "nanogpt/fineweb10B/"
