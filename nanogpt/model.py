@@ -15,14 +15,17 @@ from utils import layer_repr
 from utils import ParamInitializer
 from utils import jax_pytree_struct
 from layers import Embedding, Linear, GroupedQueryAttention
+from pallas.flash_attention import flash_attention as pallas_flash_attention
+
+ATTN_IMPL = "flash_attn"
 
 
-if jax.default_backend() == "gpu":
-    ATTN_IMPL = "cudnn"
-elif jax.default_backend() == "tpu":
-    ATTN_IMPL = "xla"
-else:
-    ATTN_IMPL = None
+def set_attn_impl(impl: str):
+    global ATTN_IMPL
+    assert impl in ("flash_attn", "xla"), (
+        f"attn_impl must be 'flash_attn' or 'xla', got '{impl}'"
+    )
+    ATTN_IMPL = impl
 
 
 @jax_pytree_struct
@@ -167,20 +170,36 @@ def attn_forward(params, x, mask, freqs):
 
     with jax.named_scope("attention"):
         scale = 1.0 / math.sqrt(q.shape[-1])
-        if mask is not None:
-            attn = jax.nn.dot_product_attention(
-                q,
-                k,
-                v,
-                mask=mask,
-                scale=scale,
-                is_causal=True,
-                implementation=ATTN_IMPL,
-            ).astype(orig_dtype)
+        if ATTN_IMPL == "flash_attn":
+            # Pallas flash attention: (B, T, H, D) -> (B, H, T, D)
+            q_fa = jnp.transpose(q, (0, 2, 1, 3))
+            k_fa = jnp.transpose(k, (0, 2, 1, 3))
+            v_fa = jnp.transpose(v, (0, 2, 1, 3))
+
+            # Pallas doesn't support GQA natively; expand KV heads to match Q heads.
+            q_heads = q_fa.shape[1]
+            kv_heads = k_fa.shape[1]
+            if kv_heads != q_heads:
+                repeats = q_heads // kv_heads
+                k_fa = jnp.repeat(k_fa, repeats, axis=1)
+                v_fa = jnp.repeat(v_fa, repeats, axis=1)
+
+            attn = pallas_flash_attention(
+                q_fa, k_fa, v_fa, causal=True, sm_scale=scale,
+            )
+            # (B, H, T, D) -> (B, T, H, D)
+            attn = jnp.transpose(attn, (0, 2, 1, 3)).astype(orig_dtype)
         else:
-            attn = jax.nn.dot_product_attention(
-                q, k, v, scale=scale, is_causal=True, implementation=ATTN_IMPL
-            ).astype(orig_dtype)
+            if mask is not None:
+                attn = jax.nn.dot_product_attention(
+                    q, k, v, mask=mask, scale=scale,
+                    is_causal=True, implementation="xla",
+                ).astype(orig_dtype)
+            else:
+                attn = jax.nn.dot_product_attention(
+                    q, k, v, scale=scale,
+                    is_causal=True, implementation="xla",
+                ).astype(orig_dtype)
 
     with jax.named_scope("projection"):
         out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
@@ -315,7 +334,7 @@ def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
             kt,         # (B, S, H, D)
             vt,         # (B, S, H, D)
             mask=mask,  # (B, 1, T, S)
-            implementation=ATTN_IMPL,
+            implementation="xla",
             scale=scale
         ).astype(orig_dtype)
         # fmt: on

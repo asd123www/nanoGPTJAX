@@ -9,6 +9,7 @@ model:
   q_heads: 8
   kv_heads: 4
   attn_type: gqa       # "gqa" or "mha"
+  attn_impl: flash_attn    # "flash_attn" or "xla"
   dtype: bfloat16
 
 hparams:

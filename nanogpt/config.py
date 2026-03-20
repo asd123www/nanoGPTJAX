@@ -138,6 +138,7 @@ class ModelConfig:
     q_heads: int = 8
     kv_heads: int = 4
     attn_type: str = "gqa"
+    attn_impl: str = "flash_attn"
     num_heads: Optional[Tuple[int, None]] = dataclasses.field(init=False)
     dtype: jnp.dtype = jnp.bfloat16
 

@@ -17,7 +17,7 @@ from jax.sharding import set_mesh
 
 from model import count_params
 from model import precompute_frequencies
-from model import GPT, forward
+from model import GPT, forward, set_attn_impl
 from utils import logical_to_sharding
 from optim import build_optimizer
 from config import ShardingRules, Config, BATCH_AXIS_NAME, load_config_from_yaml
@@ -166,7 +166,7 @@ def build_checkpoint_manager(cfg):
         max_to_keep=cfg.ckpt_cfg.max_checkpoints_to_keep,
         save_interval_steps=cfg.ckpt_cfg.checkpoint_save_steps,
         enable_async_checkpointing=True,
-        enable_background_delete=True,
+        enable_background_delete=False,
     )
     handlers = {
         "params": ocp.Checkpointer(ocp.PyTreeCheckpointHandler()),
@@ -190,10 +190,12 @@ if __name__ == "__main__":
     args = parse_args()
 
     # Data parallel: sharding along the batch axis.
+    assert jax.default_backend() == "tpu", (f"Expected TPU backend, got '{jax.default_backend()}'")
     devices = np.array(jax.devices())
     mesh = Mesh(devices, ("batch"))
     sharding_rules = ShardingRules(batch="batch")
     cfg = load_config_from_yaml(args.config, mesh=mesh, rules=sharding_rules)
+    set_attn_impl(cfg.model.attn_impl)
 
     # Prepare the data loaders.
     train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
@@ -248,13 +250,14 @@ if __name__ == "__main__":
     # Print the configuration summary
     print("\n" + "-" * 75 + "\n")
     print(line("Number of trainable params", count_params(model), comma=True))
+    print(line("Attention implementation", cfg.model.attn_impl))
     print(line("Sequence length per sample", cfg.model.seqlen))
     print(line("Micro batch size", cfg.hparams.micro_batch_size))
     print(line("Global batch size", cfg.hparams.global_batch_size))
     print(line("Grad accumulation steps", grad_accum_steps), "\n")
     print(line("LR (min, max)", str((cfg.hparams.min_lr, cfg.hparams.max_lr))))
     print(line("Warmup steps", cfg.hparams.warmup_steps))
-    print(line("Weight decay", cfg.hparams.weight_decay), "\n")
+    print(line("Weight decay", cfg.hparams.weight_decay))
     print("\n" + "-" * 75 + "\n")
 
     # Compute the frequencies
