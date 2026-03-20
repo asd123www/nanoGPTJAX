@@ -8,6 +8,7 @@ model:
   q_heads: 8
   kv_heads: 4
   attn_type: gqa
+  attn_impl: flash_attn    # "flash_attn" or "xla"
   dtype: bfloat16
 
 hparams:
@@ -35,9 +36,9 @@ hparams:
 
 checkpoint:
   max_checkpoints_to_keep: 3
-  checkpoint_save_steps: 20
-  last_checkpoint_step: 880
+  checkpoint_save_steps: 100
+  last_checkpoint_step: 0
   save_ckpt_dir: "checkpoints/small"
-  load_params_ckpt_path: "checkpoints/small/880/params"
+  load_params_ckpt_path: "checkpoints/small/4900/params"
 
 data_dir: "nanogpt/fineweb10B/"
