@@ -196,7 +196,6 @@ class HyperParams:
     min_lr: float = 6e-5
     embedding_lr: float = 0.2
     unembedding_lr: float = 0.004
-    other_peak_lr: float = 0.02
     b1: float = 0.8
     b2: float = 0.95
     weight_decay: float = 0.0
