@@ -12,6 +12,9 @@ model:
   dtype: bfloat16
 
 hparams:
+  # Schedule
+  total_train_steps: 10000
+  warmup_steps: 300
   micro_batch_size: 32
   global_batch_size: 256
 
@@ -24,15 +27,7 @@ hparams:
   b2: 0.95
   weight_decay: 0.0
   cautious_weight_decay: 0.01
-  grad_clip_norm: 1.0
-
-  # Schedule
-  total_train_steps: 10000
-  warmup_steps: 300
-
-  # Validation / early stopping
-  es_patience: 500
-  val_interval: 50
+  clip_grad_norm: 1.0
 
 checkpoint:
   max_checkpoints_to_keep: 5

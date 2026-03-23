@@ -208,13 +208,9 @@ class HyperParams:
     b2: float = 0.95
     weight_decay: float = 0.0
     cautious_weight_decay: float = 0.01
-    grad_clip_norm: float = 1.0
+    clip_grad_norm: float = 1.0
     total_train_steps: int = 10000
     warmup_steps: int = int(min(300, 0.01 * total_train_steps))  # ~10% of total steps
-
-    # Other
-    es_patience: int = 500
-    val_interval: int = 50
 
 
 DTYPE_MAP = {
