@@ -30,10 +30,6 @@ hparams:
   total_train_steps: 10000
   warmup_steps: 300
 
-  # For midtraining and SFT
-  init_lr_frac: 0.2
-  final_lr_frac: 0.0
-
   # Validation / early stopping
   es_patience: 500
   val_interval: 50

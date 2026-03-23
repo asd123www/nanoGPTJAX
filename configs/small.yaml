@@ -6,8 +6,8 @@ model:
   d_emb: 768
   num_layers: 12
   q_heads: 8
-  kv_heads: 4
-  attn_impl: flash_attn    # "flash_attn" or "xla"
+  kv_heads: 1
+  attn_impl: xla    # "flash_attn" or "xla"
   dtype: bfloat16
 
 hparams:
@@ -26,9 +26,6 @@ hparams:
   weight_decay: 0.0
   cautious_weight_decay: 0.01
   grad_clip_norm: 1.0
-  init_lr_frac: 0.2
-  final_lr_frac: 0.0
-
   es_patience: 300
   val_interval: 50
 
