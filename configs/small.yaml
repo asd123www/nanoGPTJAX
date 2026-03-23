@@ -6,7 +6,7 @@ model:
   d_emb: 768
   num_layers: 12
   q_heads: 8
-  kv_heads: 1
+  kv_heads: 4
   attn_impl: xla    # "flash_attn" or "xla"
   dtype: bfloat16
 
