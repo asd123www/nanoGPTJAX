@@ -10,6 +10,9 @@ nanogpt/fineweb10B/*
 # checkpoints
 checkpoints/
 
+# profiles
+profiles/
+
 # C extensions
 *.so
 

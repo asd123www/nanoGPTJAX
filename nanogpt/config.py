@@ -173,6 +173,14 @@ class ShardingRules:
 
 
 @dataclasses.dataclass
+class ProfileConfig:
+    enabled: bool = False
+    profile_dir: str = "profiles/"
+    start_step: int = 5
+    end_step: int = 10
+
+
+@dataclasses.dataclass
 class CheckpointConfig:
     # Checkpoint related
     max_checkpoints_to_keep: int = 5
@@ -244,6 +252,11 @@ def _build_checkpoint_config(d: dict) -> "CheckpointConfig":
     return CheckpointConfig(**d)
 
 
+def _build_profile_config(d: dict) -> "ProfileConfig":
+    d = dict(d)
+    return ProfileConfig(**d)
+
+
 def load_config_from_yaml(
     path: str | Path,
     *,
@@ -265,6 +278,7 @@ def load_config_from_yaml(
     model_cfg = _build_model_config(raw.get("model", {}))
     hparams = _build_hparams(raw.get("hparams", {}))
     ckpt_cfg = _build_checkpoint_config(raw.get("checkpoint", {}))
+    profile_cfg = _build_profile_config(raw.get("profile", {}))
     data_dir = raw.get("data_dir", "")
 
     if rules is None:
@@ -277,6 +291,7 @@ def load_config_from_yaml(
         model=model_cfg,
         hparams=hparams,
         ckpt_cfg=ckpt_cfg,
+        profile_cfg=profile_cfg,
         data_dir=data_dir,
     )
 
@@ -289,4 +304,5 @@ class Config:
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     hparams: HyperParams = dataclasses.field(default_factory=HyperParams)
     ckpt_cfg: CheckpointConfig = dataclasses.field(default_factory=CheckpointConfig)
+    profile_cfg: ProfileConfig = dataclasses.field(default_factory=ProfileConfig)
     data_dir: Path | str = ""

@@ -259,6 +259,10 @@ if __name__ == "__main__":
     print(line("LR (min, max)", str((cfg.hparams.min_lr, cfg.hparams.max_lr))))
     print(line("Warmup steps", cfg.hparams.warmup_steps))
     print(line("Weight decay", cfg.hparams.weight_decay))
+    if cfg.profile_cfg.enabled:
+        print(f"\n{'[Profiler]':<30}{'enabled':>20}")
+        print(line("Profile dir", cfg.profile_cfg.profile_dir))
+        print(line("Profile steps", f"[{cfg.profile_cfg.start_step}, {cfg.profile_cfg.end_step})"))
     print("\n" + "-" * 75 + "\n")
 
     # Compute the frequencies
@@ -281,6 +285,8 @@ if __name__ == "__main__":
     val_data_buf = np.zeros((step_batch_size, seqlen + 1), dtype=np.uint16)
 
     step = resume_from_step
+    profiling_active = False
+    profile_dir = str(Path(cfg.profile_cfg.profile_dir).resolve()) if cfg.profile_cfg.enabled else ""
     print("Starting training (the first step will take some time for compilation...)\n")
 
     training_complete = False
@@ -311,6 +317,11 @@ if __name__ == "__main__":
 
             while not shard_processed_fully:
                 try:
+                    if cfg.profile_cfg.enabled and step == cfg.profile_cfg.start_step and not profiling_active:
+                        jax.profiler.start_trace(profile_dir, create_perfetto_link=True, create_perfetto_trace=True)
+                        profiling_active = True
+                        print(f"[Profiler] Started tracing at step {step}")
+
                     start = time.time()
                     for micro_step in range(grad_accum_steps):
                         starts, ends = bf.next_batch(step_batch_size, seqlen)
@@ -340,8 +351,13 @@ if __name__ == "__main__":
                         grad_accum_steps,
                     )
 
-                    # Block for accurate timing
                     jax.block_until_ready(loss)
+
+                    if profiling_active and step + 1 >= cfg.profile_cfg.end_step:
+                        jax.profiler.stop_trace()
+                        profiling_active = False
+                        print(f"[Profiler] Stopped tracing at step {step}. Trace saved to {profile_dir}")
+
                     end = time.time()
                     dt = end - start
                     train_time_elapsed = (end - train_start_time) / 60  # in minutes
@@ -448,6 +464,10 @@ if __name__ == "__main__":
                     last_val_loss = avg_val_loss
         finally:
             del tokens
+    if profiling_active:
+        jax.profiler.stop_trace()
+        print(f"[Profiler] Stopped tracing (training ended). Trace saved to {profile_dir}")
+
     train_end_time = time.time()
     print(
         f"\nTotal time taken to train the model: {(train_end_time - train_start_time) / 60:.2f} minutes"
