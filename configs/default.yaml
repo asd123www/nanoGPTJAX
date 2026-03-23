@@ -8,7 +8,6 @@ model:
   num_layers: 16
   q_heads: 8
   kv_heads: 4
-  attn_type: gqa       # "gqa" or "mha"
   attn_impl: flash_attn    # "flash_attn" or "xla"
   dtype: bfloat16
 
@@ -21,7 +20,6 @@ hparams:
   min_lr: 6.0e-5
   embedding_lr: 0.2
   unembedding_lr: 0.004
-  other_peak_lr: 0.02
   b1: 0.8
   b2: 0.95
   weight_decay: 0.0
