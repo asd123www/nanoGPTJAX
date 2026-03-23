@@ -382,7 +382,7 @@ if __name__ == "__main__":
         print(f"Total shards consumed: {num_shards_used:<5}")
         print(f"Total Tokens consumed: {total_tokens_consumed:>9,}")
         print("-" * 75)
-xx
+
         print("\nScoring model performance on validation data...\n")
         val_loss = 0.0
         val_steps_count = 0
