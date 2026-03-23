@@ -18,7 +18,3 @@ tqdm
 # Config & logging
 pyyaml
 rich
-
-# Profile
-tensorboard
-tensorboard-plugin-profile

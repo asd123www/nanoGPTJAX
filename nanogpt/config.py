@@ -212,15 +212,10 @@ class HyperParams:
     total_train_steps: int = 10000
     warmup_steps: int = int(min(300, 0.01 * total_train_steps))  # ~10% of total steps
 
-    # For midtraining and SFT
-    init_lr_frac: float = 0.2
-    final_lr_frac: float = 0.0
-
-
     # Other
     es_patience: int = 500
     val_interval: int = 50
-    
+
 
 DTYPE_MAP = {
     "float32": jnp.float32,
