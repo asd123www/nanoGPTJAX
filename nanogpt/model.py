@@ -241,11 +241,21 @@ def precompute_frequencies(
     return sin, cos
 
 
-def calculate_rope(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
+def calculate_rope(x: jax.Array, sin: jax.Array, cos: jax.Array, heads_first=False) -> jax.Array:
+    """Apply rotary position embeddings.
+
+    Args:
+        x: (B, T, H, D) if heads_first=False, (B, H, T, D) if heads_first=True
+        sin, cos: (B, T, D/2)
+        heads_first: if True, x has layout (B, H, T, D) and sin/cos broadcast accordingly
+    """
     assert x.ndim == 4 and sin.ndim == 3 and cos.ndim == 3
     orig_dtype = x.dtype
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    sin, cos = sin[:, :, None, :], cos[:, :, None, :]
+    if heads_first:
+        sin, cos = sin[:, None, :, :], cos[:, None, :, :]  # (B, 1, T, D/2)
+    else:
+        sin, cos = sin[:, :, None, :], cos[:, :, None, :]  # (B, T, 1, D/2)
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(
         orig_dtype
     )
@@ -289,42 +299,42 @@ def mlp_forward(params, x):
 def attn_forward(params, x, mask, freqs):
     orig_dtype = x.dtype
     sin, cos = freqs
+    use_flash = ATTN_IMPL == "flash_attn"
+
+    # flash_attn (Pallas) expects (B, H, T, D); XLA expects (B, T, H, D).
+    # Produce the right layout directly from the einsum to avoid transposes.
+    qkv_einsum = "btd, dhq -> bhtq" if use_flash else "btd, dhq -> bthq"
 
     with jax.named_scope("qkv_matmul"):
-        q = jnp.einsum("btd, dhq -> bthq", x, params.wq)
-        k = jnp.einsum("btd, dhq -> bthq", x, params.wk)
-        v = jnp.einsum("btd, dhq -> bthq", x, params.wv)
+        q = jnp.einsum(qkv_einsum, x, params.wq)
+        k = jnp.einsum(qkv_einsum, x, params.wk)
+        v = jnp.einsum(qkv_einsum, x, params.wv)
 
     with jax.named_scope("qk_norm"):
         q = rmsnorm_forward(q)
         k = rmsnorm_forward(k)
 
     with jax.named_scope("rope"):
-        q = calculate_rope(q, sin, cos)
-        k = calculate_rope(k, sin, cos)
+        q = calculate_rope(q, sin, cos, heads_first=use_flash)
+        k = calculate_rope(k, sin, cos, heads_first=use_flash)
 
     with jax.named_scope("attention"):
         scale = 1.0 / math.sqrt(q.shape[-1])
-        if ATTN_IMPL == "flash_attn":
-            # Pallas flash attention: (B, T, H, D) -> (B, H, T, D)
-            q_fa = jnp.transpose(q, (0, 2, 1, 3))
-            k_fa = jnp.transpose(k, (0, 2, 1, 3))
-            v_fa = jnp.transpose(v, (0, 2, 1, 3))
-
+        if use_flash:
             # Pallas doesn't support GQA natively; expand KV heads to match Q heads.
-            q_heads = q_fa.shape[1]
-            kv_heads = k_fa.shape[1]
+            q_heads = q.shape[1]
+            kv_heads = k.shape[1]
             if kv_heads != q_heads:
                 repeats = q_heads // kv_heads
-                k_fa = jnp.repeat(k_fa, repeats, axis=1)
-                v_fa = jnp.repeat(v_fa, repeats, axis=1)
+                # Runtime overhead because pallas flash_attn doesn't support GQA natively.
+                k = jnp.repeat(k, repeats, axis=1)
+                v = jnp.repeat(v, repeats, axis=1)
 
             attn = pallas_flash_attention(
-                q_fa, k_fa, v_fa, causal=True, sm_scale=scale,
-            )
-            # (B, H, T, D) -> (B, T, H, D)
-            attn = jnp.transpose(attn, (0, 2, 1, 3)).astype(orig_dtype)
+                q, k, v, causal=True, sm_scale=scale,
+            ).astype(orig_dtype)
         else:
+            # Materialize the mask tensor: https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html.
             if mask is not None:
                 attn = jax.nn.dot_product_attention(
                     q, k, v, mask=mask, scale=scale,
@@ -337,7 +347,8 @@ def attn_forward(params, x, mask, freqs):
                 ).astype(orig_dtype)
 
     with jax.named_scope("projection"):
-        out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
+        proj_einsum = "bhtq, hqd -> btd" if use_flash else "bthq, hqd -> btd"
+        out = jnp.einsum(proj_einsum, attn, params.wo)
     return out
 
 
