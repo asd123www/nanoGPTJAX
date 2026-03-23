@@ -138,7 +138,7 @@ def get_next_batch(
 
 def build_optim(model, cfg, grad_accum_steps):
     optim = optax.chain(
-        optax.clip_by_global_norm(cfg.hparams.grad_clip_norm),
+        optax.clip_by_global_norm(cfg.hparams.clip_grad_norm),
         build_optimizer(
             model,
             d_model=cfg.model.d_emb,
@@ -272,11 +272,8 @@ if __name__ == "__main__":
         freqs = precompute_frequencies(positions=positions, features=head_dim)
 
     segment_ids = None
-    best_loss = float("inf")
+    best_val_loss = float("inf")
     last_val_loss = float("inf")
-    es_patience = cfg.hparams.es_patience
-    es_patience_counter = 0
-    best_step = 0
     num_shards_used = 0
     total_tokens_consumed = 0
 
@@ -386,7 +383,6 @@ if __name__ == "__main__":
                             f"\nReached maximum training steps  : {total_train_steps}"
                         )
                         print(f"Total number of shards consumed : {num_shards_used}")
-                        print(f"Best loss : {best_loss:.4f} at step {best_step}")
                         mngr.wait_until_finished()
                         print("Finished checkpointing! Cleaned.")
                         training_complete = True
@@ -440,27 +436,11 @@ if __name__ == "__main__":
                             del val_tokens
                     avg_val_loss = val_loss / val_steps_count
                     avg_val_loss = jax.block_until_ready(avg_val_loss)
-                    improved = avg_val_loss < best_loss
-                    if improved:
-                        best_loss = avg_val_loss
-                        best_step = step
-                        es_patience_counter = 0
-                    else:
-                        es_patience_counter += 1
-
-                    if es_patience_counter > es_patience:
-                         # fmt: off
-                        print(f"\nEarly stopping triggered! No improvement for {es_patience_counter} steps.")
-                        print(f"Total number of shards consumed : {num_shards_used}")
-                        print(f"Best loss                       : {best_loss:.4f} at step {best_step}")
-                         # fmt: on
-                        mngr.wait_until_finished()
-                        training_complete = True
-                        break
+                    best_val_loss = min(best_val_loss, avg_val_loss)
 
                     print(f"last_val_loss : {last_val_loss:.4f}")
                     print(f"curr_val_loss : {avg_val_loss:.4f}")
-                    print(f"Best loss     : {best_loss:.4f} at step {best_step}\n")
+                    print(f"best_val_loss : {best_val_loss:.4f}\n")
                     last_val_loss = avg_val_loss
         finally:
             del tokens
