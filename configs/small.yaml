@@ -15,7 +15,7 @@ hparams:
   total_train_steps: 5000
   warmup_steps: 150
   micro_batch_size: 16
-  global_batch_size: 16
+  global_batch_size: 128
 
   # Optimizer
   max_lr: 6.0e-4
