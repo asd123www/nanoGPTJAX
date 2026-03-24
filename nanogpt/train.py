@@ -17,8 +17,9 @@ from jax.sharding import set_mesh
 
 from model import count_params
 from model import precompute_frequencies
-from model import GPT, forward, set_attn_impl
-from utils import logical_to_sharding
+from model import GPT, forward, set_attn_impl, set_flash_attn_mesh
+from fsdp import shard_params, make_fsdp_forward, FSDP_AXIS_NAME
+from utils import logical_to_sharding, print_param_info
 from optim import build_optimizer
 from config import ShardingRules, Config, BATCH_AXIS_NAME, load_config_from_yaml
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
@@ -48,7 +49,7 @@ def compute_loss(params, x_batch, y_batch, segment_ids, freqs, loss_mask):
 @partial(
     jax.jit,
     static_argnames=("optim", "grad_accum_steps"),
-    donate_argnums=(0, 1, 3, 4, 5),
+    donate_argnums=(0, 5),
 )
 def train_step_accum(
     params, x_batch, y_batch, segment_ids, freqs, optim_state, optim, grad_accum_steps
@@ -190,13 +191,14 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    # Data parallel: sharding along the batch axis.
+    # FSDP: fully sharded data parallel.
     assert jax.default_backend() == "tpu", (f"Expected TPU backend, got '{jax.default_backend()}'")
     devices = np.array(jax.devices())
-    mesh = Mesh(devices, ("batch"))
-    sharding_rules = ShardingRules(batch="batch")
+    mesh = Mesh(devices, (FSDP_AXIS_NAME,))
+    sharding_rules = ShardingRules(batch=FSDP_AXIS_NAME)
     cfg = load_config_from_yaml(args.config, mesh=mesh, rules=sharding_rules)
     set_attn_impl(cfg.model.attn_impl)
+    set_flash_attn_mesh(mesh, FSDP_AXIS_NAME)
 
     # Prepare the data loaders.
     train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
@@ -210,7 +212,7 @@ if __name__ == "__main__":
     print("[Data Loader]: Number of validation files found: ", num_val_files, "\n")
 
     micro_batch_size = cfg.hparams.micro_batch_size
-    step_batch_size = micro_batch_size * mesh.shape["batch"]
+    step_batch_size = micro_batch_size * mesh.shape[FSDP_AXIS_NAME]
     global_batch_size = cfg.hparams.global_batch_size
     assert global_batch_size % step_batch_size == 0, "Global batch size must be divisible by step batch size"
     grad_accum_steps = global_batch_size // step_batch_size
@@ -226,7 +228,14 @@ if __name__ == "__main__":
     # Model, optimizer, and checkpointing
     print("Building GPT model based on the config...")
     model = GPT.init(jax.random.PRNGKey(0), cfg)
-    print("Model built successfully!")
+    print("Model built successfully!", model)
+
+    # FSDP: shard parameters and override forward with per-block unshard/reshard
+    model = shard_params(model, mesh)
+    forward = make_fsdp_forward(mesh)  # noqa: F811 — intentional rebind
+    print("FSDP sharding applied.")
+    print_param_info(model, mesh)
+
     optim, optim_state = build_optim(model, cfg, grad_accum_steps)
     ckpt_path, mngr = build_checkpoint_manager(cfg)
 

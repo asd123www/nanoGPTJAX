@@ -196,3 +196,43 @@ class ParamInitializer:
 
         # Reconstruct the original PyTree structure with the new initialized arrays.
         return jtu.tree_unflatten(spec_treedef, initialized_leaves)
+
+
+def print_param_info(params, mesh):
+    def keypath_to_str(path):
+        parts = []
+        for k in path:
+            if isinstance(k, jax.tree_util.GetAttrKey):
+                parts.append(k.name)
+            elif isinstance(k, jax.tree_util.DictKey):
+                parts.append(str(k.key))
+            elif isinstance(k, jax.tree_util.SequenceKey):
+                parts.append(f"[{k.idx}]")
+            else:
+                parts.append(str(k))
+
+        s = ""
+        for p in parts:
+            if p.startswith("["):
+                s += p
+            else:
+                if s:
+                    s += "."
+                s += p
+        return s
+
+    print("=== Mesh ===")
+    print("mesh         :", mesh)
+    print("axis_names   :", mesh.axis_names)
+    print("devices.shape:", mesh.devices.shape)
+    print("devices      :", mesh.devices)
+    flat, _ = jax.tree_util.tree_flatten_with_path(params)
+    for path, x in flat:
+        name = keypath_to_str(path)
+        if x is None:
+            print(f"{name:40} None")
+            continue
+
+        sharding = getattr(x, "sharding", None)
+        spec = getattr(sharding, "spec", sharding)
+        print(f"{name:40} shape={str(tuple(x.shape)):18} dtype={x.dtype} spec={spec}")
