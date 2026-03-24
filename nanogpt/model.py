@@ -17,6 +17,8 @@ from utils import jax_pytree_struct
 from pallas.flash_attention import flash_attention as pallas_flash_attention
 
 ATTN_IMPL = "flash_attn"
+FLASH_ATTN_MESH = None
+FLASH_ATTN_AXIS_NAME = None
 
 
 def linear_init(fan_in, fan_out):
@@ -161,6 +163,27 @@ def set_attn_impl(impl: str):
         f"attn_impl must be 'flash_attn' or 'xla', got '{impl}'"
     )
     ATTN_IMPL = impl
+
+
+def set_flash_attn_mesh(mesh, axis_name):
+    """Set the mesh used to run the Pallas flash kernel via `shard_map`."""
+    global FLASH_ATTN_MESH, FLASH_ATTN_AXIS_NAME
+    FLASH_ATTN_MESH = mesh
+    FLASH_ATTN_AXIS_NAME = axis_name
+
+# somehow Pallas flash_attn doesn't work with DP, needs to specify per-device behavior.
+def _flash_attention_forward(q, k, v, scale):
+    if FLASH_ATTN_MESH is None:
+        return pallas_flash_attention(q, k, v, causal=True, sm_scale=scale)
+
+    batch_spec = P(FLASH_ATTN_AXIS_NAME, None, None, None)
+    return jax.shard_map(
+        lambda q, k, v: pallas_flash_attention(q, k, v, causal=True, sm_scale=scale),
+        mesh=FLASH_ATTN_MESH,
+        in_specs=(batch_spec, batch_spec, batch_spec),
+        out_specs=batch_spec,
+        check_vma=False,
+    )(q, k, v)
 
 
 @jax_pytree_struct
@@ -330,9 +353,7 @@ def attn_forward(params, x, mask, freqs):
                 k = jnp.repeat(k, repeats, axis=1)
                 v = jnp.repeat(v, repeats, axis=1)
 
-            attn = pallas_flash_attention(
-                q, k, v, causal=True, sm_scale=scale,
-            ).astype(orig_dtype)
+            attn = _flash_attention_forward(q, k, v, scale).astype(orig_dtype)
         else:
             # Materialize the mask tensor: https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html.
             if mask is not None:
