@@ -105,6 +105,15 @@ def make_fsdp_forward(mesh):
     Embedding and lm_head are also unsharded for their respective ops.
     """
 
+    @jax.checkpoint
+    def _checkpointed_block(block, x, mask, freqs, i):
+        with jax.named_scope(f"fsdp_block_{i}"):
+            with jax.named_scope("unshard"):
+                full_block = unshard(block, mesh, after=x)
+            with jax.named_scope("compute"):
+                x = block_forward(full_block, x, mask, freqs)
+        return x
+
     def fsdp_forward(params, x, segment_ids, freqs):
         if segment_ids is not None:
             with jax.named_scope("compute_mask"):
@@ -117,11 +126,7 @@ def make_fsdp_forward(mesh):
             x = embedding_forward(full_embed, x)
 
         for i, block in enumerate(params.blocks):
-            with jax.named_scope(f"fsdp_block_{i}"):
-                with jax.named_scope("unshard"):
-                    full_block = unshard(block, mesh, after=x)
-                with jax.named_scope("compute"):
-                    x = block_forward(full_block, x, mask, freqs)
+            x = _checkpointed_block(block, x, mask, freqs, i)
 
         with jax.named_scope("norm"):
             x = rmsnorm_forward(x)
