@@ -3,9 +3,9 @@
 Each parameter is sharded along its first dimension across the "fsdp" mesh
 axis. Before computing a transformer block, all parameters in that block are
 all-gathered (unshard) so the forward runs on full replicated weights. After
-the block, the gathered copies go dead while the original parameter tree
-remains sharded. During the backward pass XLA re-gathers parameters as needed
-for gradient computation.
+the block, the gathered copies(i.e. temporary buffers) go dead while the original 
+parameter tree remains sharded. During the backward pass XLA re-gathers parameters 
+as needed for gradient computation.
 """
 
 import jax
