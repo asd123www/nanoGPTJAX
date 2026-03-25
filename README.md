@@ -35,6 +35,13 @@ python3.11 nanogpt/inference.py --config configs/small.yaml
 
 This starts an interactive prompt where you type text and the model generates a completion. Make sure the checkpoint path in your config file points to a valid trained checkpoint.
 
+## Profiling
+
+```bash
+pip install tensorboard tensorboard-plugin-profile
+~/.local/bin/tensorboard --logdir profiles/ --port 6006
+```
+
 ## Acknowledgements
 
 This project is based on [nanoGPTJAX](https://github.com/AakashKumarNain/nanoGPTJAX) by Aakash Kumar Nain. Thanks to the original project for providing a clean, from-scratch JAX implementation of GPT training and inference.
