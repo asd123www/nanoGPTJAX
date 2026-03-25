@@ -319,7 +319,7 @@ if __name__ == "__main__":
 
         for _ in range(steps_in_shard):
             if cfg.profile_cfg.enabled and step == cfg.profile_cfg.start_step and not profiling_active:
-                jax.profiler.start_trace(profile_dir, create_perfetto_link=True, create_perfetto_trace=True)
+                jax.profiler.start_trace(profile_dir)
                 profiling_active = True
                 print(f"[Profiler] Started tracing at step {step}")
 

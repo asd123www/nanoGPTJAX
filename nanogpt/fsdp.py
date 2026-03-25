@@ -81,29 +81,23 @@ def unshard(params, mesh, after=None):
     return jax.tree_util.tree_map(_replicate, params)
 
 
-def reshard(params, mesh):
-    """Re-shard replicated params back to FSDP partitioning.
-
-    The current forward path does not need this explicitly because the source
-    parameters stay sharded for the whole step; only the temporary gathered
-    copies are materialized per block.
-    """
-    def _shard(x):
-        if x is None:
-            return None
-        return jax.lax.with_sharding_constraint(
-            x, NamedSharding(mesh, _fsdp_spec(x.ndim))
-        )
-    return jax.tree_util.tree_map(_shard, params)
-
-
 def make_fsdp_forward(mesh):
     """Return a forward function (same signature as model.forward) that
     unshards each transformer block's parameters before its computation.
 
     Granularity: one transformer block = one unshard/compute/free cycle.
     Embedding and lm_head are also unsharded for their respective ops.
+    But the compiler determines the actual calling order.
     """
+
+    @jax.checkpoint
+    def _checkpointed_block(block, x, mask, freqs, i):
+        with jax.named_scope(f"fsdp_block_{i}"):
+            with jax.named_scope("unshard"):
+                full_block = unshard(block, mesh, after=x)
+            with jax.named_scope("compute"):
+                x = block_forward(full_block, x, mask, freqs)
+        return x
 
     def fsdp_forward(params, x, segment_ids, freqs):
         if segment_ids is not None:
@@ -117,11 +111,7 @@ def make_fsdp_forward(mesh):
             x = embedding_forward(full_embed, x)
 
         for i, block in enumerate(params.blocks):
-            with jax.named_scope(f"fsdp_block_{i}"):
-                with jax.named_scope("unshard"):
-                    full_block = unshard(block, mesh, after=x)
-                with jax.named_scope("compute"):
-                    x = block_forward(full_block, x, mask, freqs)
+            x = _checkpointed_block(block, x, mask, freqs, i)
 
         with jax.named_scope("norm"):
             x = rmsnorm_forward(x)
