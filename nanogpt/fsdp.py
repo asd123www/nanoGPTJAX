@@ -81,28 +81,13 @@ def unshard(params, mesh, after=None):
     return jax.tree_util.tree_map(_replicate, params)
 
 
-def reshard(params, mesh):
-    """Re-shard replicated params back to FSDP partitioning.
-
-    The current forward path does not need this explicitly because the source
-    parameters stay sharded for the whole step; only the temporary gathered
-    copies are materialized per block.
-    """
-    def _shard(x):
-        if x is None:
-            return None
-        return jax.lax.with_sharding_constraint(
-            x, NamedSharding(mesh, _fsdp_spec(x.ndim))
-        )
-    return jax.tree_util.tree_map(_shard, params)
-
-
 def make_fsdp_forward(mesh):
     """Return a forward function (same signature as model.forward) that
     unshards each transformer block's parameters before its computation.
 
     Granularity: one transformer block = one unshard/compute/free cycle.
     Embedding and lm_head are also unsharded for their respective ops.
+    But the compiler determines the actual calling order.
     """
 
     @jax.checkpoint
