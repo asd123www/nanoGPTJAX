@@ -12,7 +12,8 @@ from jax.sharding import Mesh
 from model import GPT, forward_v2
 from kvcache import KVCache, count_left_padding, prepare_chunk
 from checkpoint_utils import load_weights_from_checkpoint_with_validation
-from config import ShardingRules, Config, BATCH_AXIS_NAME, load_config_from_yaml
+from config import Config, load_config_from_yaml
+from utils import DP_AXIS_NAME
 
 import tiktoken
 
@@ -183,7 +184,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Run GPT inference")
     parser.add_argument(
-        "--config", type=str, default=None,
+        "--config", type=str, default="configs/default.yaml",
         help="Path to a YAML configuration file (e.g. configs/default.yaml)",
     )
     cli_args = parser.parse_args()
@@ -191,19 +192,14 @@ if __name__ == "__main__":
     devices = np.array(jax.devices())
     print("Found devices: ", devices)
     print("Platform: ", devices[0].platform)
-    mesh = Mesh(devices, axis_names=BATCH_AXIS_NAME)
-    sharding_rules = ShardingRules(batch=BATCH_AXIS_NAME)
-
-    if cli_args.config is not None:
-        print(f"Loading configuration from: {cli_args.config}")
-        cfg = load_config_from_yaml(cli_args.config, mesh=mesh, rules=sharding_rules)
-    else:
-        cfg = Config(mesh=mesh, rules=sharding_rules)
+    mesh = Mesh(devices, axis_names=DP_AXIS_NAME)
+    print(f"Loading configuration from: {cli_args.config}")
+    cfg = load_config_from_yaml(cli_args.config, mesh=mesh)
 
     # Get the weight shardings
     print("Building GPT model based on the config...")
     model = GPT.init(jax.random.PRNGKey(0), cfg)
-    model_sharding = GPT.shardings(cfg.mesh, cfg.rules, cfg.model)
+    model_sharding = GPT.shardings(cfg.mesh, cfg.model)
     print("Model built successfully!\n")
     ckpt_params_path = str(Path(cfg.ckpt_cfg.load_params_ckpt_path).resolve())
     model = load_weights_from_checkpoint_with_validation(
@@ -229,7 +225,7 @@ if __name__ == "__main__":
 
     cache_key = jax.random.PRNGKey(1)
     batch_size = input_ids.shape[0]
-    cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+    cache = KVCache.init(cache_key, cfg.mesh, batch_size, cfg)
 
     with jax.set_mesh(cfg.mesh):
         key, prefill_key, decode_key = jax.random.split(key, 3)
@@ -283,7 +279,7 @@ if __name__ == "__main__":
         encoded = tokenizer.encode_batch(prompts, allowed_special="all")
         input_ids, segment_ids = pad_tokens(encoded, PAD_ID, pad_to_power_of_two=True)
         batch_size = input_ids.shape[0]
-        cache = KVCache.init(cache_key, cfg.mesh, cfg.rules, batch_size, cfg)
+        cache = KVCache.init(cache_key, cfg.mesh, batch_size, cfg)
         key, prefill_key, decode_key = jax.random.split(key, 3)
 
         start = time.perf_counter()

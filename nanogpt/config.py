@@ -8,20 +8,6 @@ from jax.sharding import Mesh
 from utils import jax_pytree_struct
 
 
-AxisName = str | tuple[str, ...] | None
-Axes = tuple[AxisName, ...]
-
-# Expected physical mesh axis names:
-# x - batch
-# y - 1st of 2D tensor sharding
-# z - 2nd of 2D tensor sharding
-BATCH_AXIS_NAME = "x"
-EXPERT_AXIS_NAME = "z"
-TENSOR_ONLY_AXIS_NAME = "y"
-ATTN_HEADS_AXIS_NAME = "y"
-TENSOR_AXIS_NAME = ("y", "z")
-
-
 def init_uniform(scale=1.0):
     def kernel_init(key, shape, dtype):
         return jax.random.uniform(key, shape, dtype, minval=-scale, maxval=scale)
@@ -34,7 +20,6 @@ class EmbeddingConfig:
     dtype: jnp.dtype = jnp.bfloat16
     vocab_size: int = 50304
     d_emb: int = 768
-    num_layers: int = 12
     weight_initializer: Callable = dataclasses.field(init=False)
     weight_logical_axes: Tuple[str, str] = ("embed_in", "embed_out")
 
@@ -48,7 +33,6 @@ class GroupedQueryAttentionConfig:
     d_emb: int = 768
     q_heads: int = 8
     kv_heads: int = 4
-    num_layers: int = 12
     head_dim: int = dataclasses.field(init=False)
 
     wq_initializer: Callable = dataclasses.field(init=False)
@@ -134,14 +118,12 @@ class ModelConfig:
             dtype=self.dtype,
             vocab_size=self.vocab_size,
             d_emb=self.d_emb,
-            num_layers=self.num_layers,
         )
         self.attn = GroupedQueryAttentionConfig(
             dtype=self.dtype,
             d_emb=self.d_emb,
             q_heads=self.q_heads,
             kv_heads=self.kv_heads,
-            num_layers=self.num_layers,
         )
         self.mlp = MLPConfig(
             dtype=self.dtype,
@@ -154,36 +136,6 @@ class ModelConfig:
             out_features=self.vocab_size,
             weight_initializer=jax.nn.initializers.normal(stddev=0.001),
         )
-
-
-@dataclasses.dataclass
-class ShardingRules:
-    batch: AxisName = BATCH_AXIS_NAME
-    sequence: AxisName = None
-    act_embed: AxisName = None
-    act_heads: AxisName = None
-
-    embed_in: AxisName = None
-    embed_out: AxisName = None
-
-    attn_wqkv_in: AxisName = None
-    attn_q_heads: AxisName = None
-    attn_kv_heads: AxisName = None
-    attn_head_dim: AxisName = None
-
-    attn_wo_in: AxisName = None
-    attn_wo_out: AxisName = None
-
-    norm_in: AxisName = None
-    norm_out: AxisName = None
-
-    mlp_fc1_in: AxisName = None
-    mlp_fc1_out: AxisName = None
-    mlp_fc2_in: AxisName = None
-    mlp_fc2_out: AxisName = None
-
-    linear_in: AxisName = None
-    linear_out: AxisName = None
 
 
 @dataclasses.dataclass
@@ -211,7 +163,6 @@ class HyperParams:
     # Batch size related
     micro_batch_size: int = 32
     global_batch_size: int = 256
-    grad_accum_steps: Optional[float] = dataclasses.field(init=False)
 
     # Optimizer related
     max_lr: float = 6e-4
@@ -266,14 +217,13 @@ def load_config_from_yaml(
     path: str | Path,
     *,
     mesh: Mesh = None,
-    rules: "ShardingRules" = None,
     seed: jax.Array = None,
 ) -> "Config":
     """Build a Config from a YAML file.
 
     The YAML file is expected to have top-level keys matching the Config
     sub-configs: ``model``, ``hparams``, ``checkpoint``, and optionally
-    ``data_dir``.  Runtime objects (mesh, rules, seed) are passed as
+    ``data_dir``. Runtime objects (mesh, seed) are passed as
     keyword arguments since they cannot be serialized.
     """
     path = Path(path)
@@ -286,13 +236,9 @@ def load_config_from_yaml(
     profile_cfg = _build_profile_config(raw.get("profile", {}))
     data_dir = raw.get("data_dir", "")
 
-    if rules is None:
-        rules = ShardingRules()
-
     return Config(
         seed=seed,
         mesh=mesh,
-        rules=rules,
         model=model_cfg,
         hparams=hparams,
         ckpt_cfg=ckpt_cfg,
@@ -305,7 +251,6 @@ def load_config_from_yaml(
 class Config:
     seed: jax.Array = None
     mesh: Mesh = None
-    rules: ShardingRules = dataclasses.field(default_factory=ShardingRules)
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     hparams: HyperParams = dataclasses.field(default_factory=HyperParams)
     ckpt_cfg: CheckpointConfig = dataclasses.field(default_factory=CheckpointConfig)

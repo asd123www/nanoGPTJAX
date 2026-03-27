@@ -73,8 +73,8 @@ class KVCache(ParamInitializer):
         return (self.k, self.v)
 
     @classmethod
-    def init(cls, key, mesh, rules, batch_size, cfg):
-        return cls._init_fn(key, mesh, rules, batch_size, cfg)
+    def init(cls, key, mesh, batch_size, cfg):
+        return cls._init_fn(key, mesh, batch_size, cfg)
 
     def __repr__(self):
         return layer_repr(self)

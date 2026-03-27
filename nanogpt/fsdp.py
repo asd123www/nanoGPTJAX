@@ -1,6 +1,6 @@
 """Fully Sharded Data Parallel (FSDP) for JAX.
 
-Each parameter is sharded along its first dimension across the "fsdp" mesh
+Each parameter is sharded along its first dimension across the data-parallel
 axis. Before computing a transformer block, all parameters in that block are
 all-gathered (unshard) so the forward runs on full replicated weights. After
 the block, the gathered copies(i.e. temporary buffers) go dead while the original 
@@ -19,15 +19,14 @@ from model import (
     linear_forward,
     rmsnorm_forward,
 )
-
-FSDP_AXIS_NAME = "fsdp"
+from utils import DP_AXIS_NAME
 
 
 def _fsdp_spec(ndim):
     """Shard first dimension across FSDP devices, replicate the rest."""
     if ndim == 0:
         return P()
-    return P(FSDP_AXIS_NAME, *((None,) * (ndim - 1)))
+    return P(DP_AXIS_NAME, *((None,) * (ndim - 1)))
 
 
 def _replicated_spec(ndim):

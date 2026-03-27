@@ -12,16 +12,18 @@ import numpy as np
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.sharding import set_mesh
 
 
 from model import count_params
 from model import precompute_frequencies
 from model import GPT, forward, set_attn_impl, set_flash_attn_mesh
-from fsdp import shard_params, make_fsdp_forward, FSDP_AXIS_NAME
-from utils import logical_to_sharding, print_param_info
+from fsdp import shard_params, make_fsdp_forward
+from utils import DP_AXIS_NAME, print_param_info
 from optim import build_optimizer
-from config import ShardingRules, Config, BATCH_AXIS_NAME, load_config_from_yaml
+from config import load_config_from_yaml
 from fineweb_dataloader import make_grain_shard_loader, BOSFinder
 
 
@@ -194,11 +196,10 @@ if __name__ == "__main__":
     # FSDP: fully sharded data parallel.
     assert jax.default_backend() == "tpu", (f"Expected TPU backend, got '{jax.default_backend()}'")
     devices = np.array(jax.devices())
-    mesh = Mesh(devices, (FSDP_AXIS_NAME,))
-    sharding_rules = ShardingRules(batch=FSDP_AXIS_NAME)
-    cfg = load_config_from_yaml(args.config, mesh=mesh, rules=sharding_rules)
+    mesh = Mesh(devices, (DP_AXIS_NAME,))
+    cfg = load_config_from_yaml(args.config, mesh=mesh)
     set_attn_impl(cfg.model.attn_impl)
-    set_flash_attn_mesh(mesh, FSDP_AXIS_NAME)
+    set_flash_attn_mesh(mesh, DP_AXIS_NAME)
 
     # Prepare the data loaders.
     train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
@@ -212,14 +213,14 @@ if __name__ == "__main__":
     print("[Data Loader]: Number of validation files found: ", num_val_files, "\n")
 
     micro_batch_size = cfg.hparams.micro_batch_size
-    step_batch_size = micro_batch_size * mesh.shape[FSDP_AXIS_NAME]
+    step_batch_size = micro_batch_size * mesh.shape[DP_AXIS_NAME]
     global_batch_size = cfg.hparams.global_batch_size
     assert global_batch_size % step_batch_size == 0, "Global batch size must be divisible by step batch size"
     grad_accum_steps = global_batch_size // step_batch_size
 
-    # ToDo: what is this for?
-    data_sharding = logical_to_sharding(("batch",), cfg.mesh, cfg.rules)
-    data_accum_sharding = logical_to_sharding((None, "batch", None), cfg.mesh, cfg.rules)
+    # Shard the data across the data-parallel mesh axis.
+    data_sharding = NamedSharding(cfg.mesh, P(DP_AXIS_NAME))
+    data_accum_sharding = NamedSharding(mesh, P(None, DP_AXIS_NAME, None))
 
     seqlen = cfg.model.seqlen
     total_train_steps = cfg.hparams.total_train_steps

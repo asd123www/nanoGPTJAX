@@ -29,10 +29,10 @@ hparams:
 
 checkpoint:
   max_checkpoints_to_keep: 3
-  checkpoint_save_steps: 10000
+  checkpoint_save_steps: 200
   last_checkpoint_step: 0
   save_ckpt_dir: "checkpoints/project1-part1"
-  load_params_ckpt_path: "checkpoints/project1-part1/0/params"
+  load_params_ckpt_path: "checkpoints/project1-part1/400/params"
 
 profile:
   enabled: true

@@ -65,8 +65,8 @@ class Linear(ParamInitializer):
         )
 
     @classmethod
-    def init(cls, key, mesh, rules, cfg):
-        return cls._init_fn(key, mesh, rules, cfg)
+    def init(cls, key, mesh, cfg):
+        return cls._init_fn(key, mesh, cfg)
 
     def __repr__(self):
         return layer_repr(self)
@@ -122,8 +122,8 @@ class GroupedQueryAttention(ParamInitializer):
         )
 
     @classmethod
-    def init(cls, key, mesh, rules, cfg):
-        return cls._init_fn(key, mesh, rules, cfg)
+    def init(cls, key, mesh, cfg):
+        return cls._init_fn(key, mesh, cfg)
 
     def __repr__(self):
         return layer_repr(self)
@@ -150,8 +150,8 @@ class Embedding(ParamInitializer):
         )
 
     @classmethod
-    def init(cls, key, mesh, rules, cfg):
-        return cls._init_fn(key, mesh, rules, cfg)
+    def init(cls, key, mesh, cfg):
+        return cls._init_fn(key, mesh, cfg)
 
     def __repr__(self):
         return layer_repr(self)
@@ -225,13 +225,13 @@ class GPT(ParamInitializer):
     @classmethod
     def param_specs(cls, cfg):
         embed = Embedding.param_specs(cfg.embed)
-        blocks = [TransformerBlock.param_specs(cfg) for _ in range(cfg.attn.num_layers)]
+        blocks = [TransformerBlock.param_specs(cfg) for _ in range(cfg.num_layers)]
         lm_head = Linear.param_specs(cfg.lm_head)
         return GPT(embed=embed, blocks=blocks, lm_head=lm_head)
 
     @classmethod
     def init(cls, key, cfg):
-        return cls._init_fn(key, cfg.mesh, cfg.rules, cfg.model)
+        return cls._init_fn(key, cfg.mesh, cfg.model)
 
     def __repr__(self):
         return layer_repr(self)
