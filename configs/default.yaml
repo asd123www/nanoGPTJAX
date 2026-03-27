@@ -5,6 +5,7 @@ model:
   seqlen: 2048
   vocab_size: 50304
   d_emb: 1536
+  mlp_hidden_dim: 6144
   num_layers: 24
   q_heads: 12
   kv_heads: 12

@@ -10,6 +10,7 @@ from jax.sharding import PartitionSpec as P, NamedSharding
 
 AxisName = str | Tuple[str, ...] | None
 Axes = Tuple[AxisName, ...]
+DP_AXIS_NAME = "dp"
 
 
 def jax_pytree_struct(cls):
@@ -43,10 +44,28 @@ def is_param_spec(x):
     return istype(x, ParamSpec)
 
 
-def logical_to_physical(logical: Axes, rules) -> jax.sharding.PartitionSpec:
-    """Returns how to physically shard a given sequence of logical array dimensions (i.e. the logical shape of an array)."""
-    spec = [getattr(rules, axis) if axis is not None else None for axis in logical]
-    flat_axes = jtu.tree_leaves(spec)
+def _batch_mesh_axis(mesh: jax.sharding.Mesh):
+    axis_names = mesh.axis_names
+    if not isinstance(axis_names, tuple):
+        axis_names = (axis_names,)
+    if len(axis_names) != 1:
+        raise ValueError(
+            f"Batch-only sharding expects a 1D mesh, got axis_names={axis_names}"
+        )
+    return axis_names[0]
+
+
+def logical_to_physical(
+    logical: Axes, mesh: jax.sharding.Mesh
+) -> jax.sharding.PartitionSpec:
+    """Map logical axes to a physical sharding.
+
+    Only the logical `batch` axis is sharded across the single mesh axis.
+    All other logical axes are replicated.
+    """
+    batch_axis = _batch_mesh_axis(mesh)
+    spec = [batch_axis if axis == "batch" else None for axis in logical]
+    flat_axes = [axis for axis in jtu.tree_leaves(spec) if axis is not None]
     if len(set(flat_axes)) != len(flat_axes):
         raise ValueError(
             f"Colliding physical axes from translating logical spec {logical} -> {spec}"
@@ -54,12 +73,10 @@ def logical_to_physical(logical: Axes, rules) -> jax.sharding.PartitionSpec:
     return P(*spec)
 
 
-def logical_to_sharding(
-    logical: Axes, mesh: jax.sharding.Mesh, rules
-) -> jax.sharding.Sharding:
-    """Returns the sharding for a given sequence of logical array dimensions (i.e. the logical shape of an array)."""
+def logical_to_sharding(logical: Axes, mesh: jax.sharding.Mesh) -> jax.sharding.Sharding:
+    """Return a NamedSharding for the given logical axes."""
     assert mesh is not None
-    return NamedSharding(mesh, logical_to_physical(logical, rules))
+    return NamedSharding(mesh, logical_to_physical(logical, mesh))
 
 
 def get_partition_spec_from_layers(tree):
@@ -154,19 +171,19 @@ class ParamInitializer:
         raise NotImplementedError
 
     @classmethod
-    def shardings(cls, mesh, rules, *args, **kwargs):
+    def shardings(cls, mesh, *args, **kwargs):
         """Defines the shardings parameters in a PyTree."""
 
         # Get the PyTree of parameter specifications.
         specs = cls.param_specs(*args, **kwargs)
         return jtu.tree_map(
-            lambda spec: logical_to_sharding(spec.logical_axes, mesh, rules),
+            lambda spec: logical_to_sharding(spec.logical_axes, mesh),
             specs,
             is_leaf=is_param_spec,
         )
 
     @classmethod
-    def _init_fn(cls, key, mesh, rules, *args, **kwargs):
+    def _init_fn(cls, key, mesh, *args, **kwargs):
         """
         Initializes the actual JAX arrays for all parameters.
 
@@ -180,7 +197,7 @@ class ParamInitializer:
 
         # Create a parallel PyTree of sharding objects from the specs.
         shardings = jtu.tree_map(
-            lambda spec: logical_to_sharding(spec.logical_axes, mesh, rules),
+            lambda spec: logical_to_sharding(spec.logical_axes, mesh),
             specs,
             is_leaf=is_param_spec,
         )
