@@ -82,21 +82,26 @@ class LinearConfig:
 @dataclasses.dataclass
 class MLPConfig:
     d_emb: int = 768
+    mlp_hidden_dim: Optional[int] = None
     dtype: jnp.dtype = jnp.bfloat16
     fc1: LinearConfig = dataclasses.field(init=False)
     fc2: LinearConfig = dataclasses.field(init=False)
 
     def __post_init__(self):
+        hidden_dim = self.mlp_hidden_dim or (self.d_emb * 4)
+        if hidden_dim <= 0:
+            raise ValueError(f"mlp_hidden_dim must be positive, got {hidden_dim}")
+        self.mlp_hidden_dim = hidden_dim
         self.fc1 = LinearConfig(
             dtype=self.dtype,
             in_features=self.d_emb,
-            out_features=self.d_emb * 4,
+            out_features=self.mlp_hidden_dim,
             weight_initializer=init_uniform(scale=3**0.5 * self.d_emb**-0.5),
             weight_logical_axes=("mlp_fc1_in", "mlp_fc1_out"),
         )
         self.fc2 = LinearConfig(
             dtype=self.dtype,
-            in_features=self.d_emb * 4,
+            in_features=self.mlp_hidden_dim,
             out_features=self.d_emb,
             weight_initializer=jax.nn.initializers.zeros,
             weight_logical_axes=("mlp_fc2_in", "mlp_fc2_out"),
@@ -108,6 +113,7 @@ class ModelConfig:
     seqlen: int = 2048
     vocab_size: int = 50304
     d_emb: int = 768
+    mlp_hidden_dim: Optional[int] = None
     num_layers: int = 16
     q_heads: int = 8
     kv_heads: int = 4
@@ -120,6 +126,10 @@ class ModelConfig:
     attn: GroupedQueryAttentionConfig = dataclasses.field(init=False)
 
     def __post_init__(self):
+        hidden_dim = self.mlp_hidden_dim or (self.d_emb * 4)
+        if hidden_dim <= 0:
+            raise ValueError(f"mlp_hidden_dim must be positive, got {hidden_dim}")
+        self.mlp_hidden_dim = hidden_dim
         self.embed = EmbeddingConfig(
             dtype=self.dtype,
             vocab_size=self.vocab_size,
@@ -133,7 +143,11 @@ class ModelConfig:
             kv_heads=self.kv_heads,
             num_layers=self.num_layers,
         )
-        self.mlp = MLPConfig(dtype=self.dtype, d_emb=self.d_emb)
+        self.mlp = MLPConfig(
+            dtype=self.dtype,
+            d_emb=self.d_emb,
+            mlp_hidden_dim=self.mlp_hidden_dim,
+        )
         self.lm_head = LinearConfig(
             dtype=self.dtype,
             in_features=self.d_emb,

@@ -1,11 +1,9 @@
-# Small model for single TPU v5e chip.
-
 model:
   seqlen: 1024
   vocab_size: 50304
   d_emb: 768
   mlp_hidden_dim: 3072
-  num_layers: 12
+  num_layers: 6
   q_heads: 8
   kv_heads: 8
   attn_impl: xla    # "flash_attn" or "xla"
@@ -13,10 +11,10 @@ model:
 
 hparams:
   # Schedule
-  total_train_steps: 5000
+  total_train_steps: 500
   warmup_steps: 150
-  micro_batch_size: 16
-  global_batch_size: 64
+  micro_batch_size: 8
+  global_batch_size: 8
 
   # Optimizer
   max_lr: 6.0e-4
@@ -31,10 +29,10 @@ hparams:
 
 checkpoint:
   max_checkpoints_to_keep: 3
-  checkpoint_save_steps: 100
+  checkpoint_save_steps: 10000
   last_checkpoint_step: 0
-  save_ckpt_dir: "checkpoints/small"
-  load_params_ckpt_path: "checkpoints/small/0/params"
+  save_ckpt_dir: "checkpoints/project1-part1"
+  load_params_ckpt_path: "checkpoints/project1-part1/0/params"
 
 profile:
   enabled: true
