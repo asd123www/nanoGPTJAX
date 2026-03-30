@@ -1,5 +1,4 @@
 # Default configuration for nanoGPT-JAX
-# This matches the hardcoded defaults in config.py
 
 model:
   seqlen: 2048
