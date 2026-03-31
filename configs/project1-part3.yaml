@@ -32,8 +32,8 @@ checkpoint:
   max_checkpoints_to_keep: 3
   checkpoint_save_steps: 1000
   last_checkpoint_step: 0
-  save_ckpt_dir: "checkpoints/project1-part2"
-  load_params_ckpt_path: "checkpoints/project1-part2/0/params"
+  save_ckpt_dir: "checkpoints/project1-part3"
+  load_params_ckpt_path: "checkpoints/project1-part3/0/params"
 
 profile:
   enabled: true
