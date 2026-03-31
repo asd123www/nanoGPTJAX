@@ -2,7 +2,7 @@
 
 ## Lab1 Overview
 
-In this lab, we will become familiar with large language model (LLM) training and the infrastructure we will use in the upcoming labs. In particular, we will profile the training process of a GPT-2 style language model on a single accelerator, with the focus on its compute characteristics and memory footprint. Understanding the compute and memory behavior of LLM training will help you understand the key challenges of scaling LLMs, and will motivate the systems techniques we discuss in class as well as in later labs. Lab 1 also covers some core concepts and prepares you for the following labs.
+In this lab, you will become familiar with large language model (LLM) training and the framework we will use in the upcoming labs. In particular, we will profile the training process of a GPT-2 style language model on a single accelerator, with the focus on its compute characteristics and memory footprint. Understanding the compute and memory behavior of LLM training will help you understand the key challenges of scaling LLMs, and will motivate the systems techniques we discuss in class as well as in later labs. Lab 1 also covers some key concepts and prepares you for the following labs.
 
 We will build our training pipeline in JAX, a Python library that supports automatic differentiation for machine learning and provides efficient scaling through just-in-time (JIT) compilation. To improve training throughput, we will use a TPU accelerator, an application-specific integrated circuit (ASIC) developed by Google for efficient neural network computation. The model we study is a GPT-2-style model, which includes many of the key components used in modern LLMs, such as Transformer blocks with self-attention.
 
@@ -13,9 +13,9 @@ We need access to a TPU server to run our training script. We will use Colab, a 
 
 We will start from the same Colab environment and install the dependencies on top of that. Follow the instructions below to build the environment and run our training script.
 
-1. Change runtime type. Open [Google Colab](https://colab.research.google.com/) and create a new notebook. Click the dropdown arrow next to `Connect`, select "Change runtime type", use `Python3, v5e-1 TPU, and 2025.07` runtime version.
+1. Change runtime type. Open [Google Colab](https://colab.research.google.com/) and create a new notebook. Click the dropdown arrow next to `Connect`, select `Change runtime type`, use `Python3`, `v5e-1 TPU`, and `2025.07 runtime version`.
 
-2. Check your TPU-info. Click "Terminal" in lower left corner, type `tpu-info`, make sure you have 1 TPU v5e acclerator.
+2. Check your TPU-info. Click `Terminal` in lower left corner, execute `tpu-info`, make sure you have 1 TPU v5e acclerator.
 
 3. Setup Lab 1 environment. Download our repo via `git clone https://github.com/asd123www/nanoGPTJAX.git`. In the root directory, run `python3.11 -m pip install -r requirements.txt` to install the dependencies. Also download the dataset and profile tools.
    ```
@@ -37,21 +37,21 @@ We will start from the same Colab environment and install the dependencies on to
 
 ## The GPT-2 model training
 
-At a high level, this codebase is organized around a single training entrypoint, `nanogpt/train.py`, which wires together the data pipeline, model definition, optimizer, checkpointing, and profiling. Most of the core logic lives in the `nanogpt/` directory: `fineweb_dataloader.py` loads token shards, `model.py` defines the GPT2-style model, `optim.py` builds the optimizer, `config.py` turns config YAML files in `configs/` into runtime configs, and `checkpoint_utils.py` handles state checkpoint.
+At a high level, this codebase is organized around a single training entrypoint, `nanogpt/train.py`, which connects the data pipeline, model definition, optimizer, checkpointing, and profiling. Most of the core logic lives in the `nanogpt/` directory: `fineweb_dataloader.py` loads token shards, `model.py` defines the GPT2-style model, `optim.py` builds the optimizer, `config.py` turns config YAML files in `configs/` into runtime configs, and `checkpoint_utils.py` handles state checkpoint.
 
 ### DataLoading and Tokenization
 
 We train on the pretokenized FineWeb dataset. `download_fineweb_tokens.py` downloads these cached GPT-2 token files from Hugging Face so we can skip the tokenization step and start training immediately.
 
-**Token** is the unit of text processing in LLM. Tokens allow the model to process language as discrete elements rather than raw texts. The conversion between text and tokens is handled by the **tokenizer**, which defines a mapping from text to token IDs and back. Specifically, the tokenizer encodes raw text into a sequence of tokens before training, and decodes output tokens back into text. Tokenization is essential for both LLM capability and efficiency. GPT-2 adopts Byte Pair Encoding (BPE), a subword-based tokenization method [BPE impl]{https://github.com/karpathy/minbpe/blob/master/minbpe/basic.py}. 
+**Token** is the unit of text processing in LLM. Tokens allow the model to process language as discrete elements rather than raw texts. The conversion between text and tokens is handled by the **tokenizer**, which defines a mapping from text to token IDs and back. Specifically, the tokenizer encodes raw text into a sequence of tokens before training, and decodes output tokens back into text. Tokenization is essential for both LLM capability and efficiency. GPT-2 adopts Byte Pair Encoding (BPE), a subword-based tokenization method (check [BPE impl](https://github.com/karpathy/minbpe/blob/master/minbpe/basic.py)). 
 
-The loading logic lives in `fineweb_dataloader.py`. `LoadShardTokens` reads each shard into CPU memory, validates the file header, and extracts the token array together with the positions of the beginning-of-sequence token. `BOSFinder` then builds efficient `(start, end)` ranges for each batch so the training loop can pack contiguous sequences of length `seqlen + 1` without re-scanning the entire shard every step. In `train.py`, these ranges are assembled into input tokens `x` and next-token labels `y`, then loaded to the TPU.
+The loading logic lives in `fineweb_dataloader.py`. `LoadShardTokens` reads each shard into CPU memory, validates the file header, and extracts the token array together with the positions of the beginning-of-sequence token. `BOSFinder` then builds efficient `(start, end)` ranges for each batch so the training loop can pack contiguous sequences of length `seqlen + 1` without re-scanning the entire shard every step. In `train.py`, these ranges are assembled into input tokens `x` and next-token labels `y`, then loaded to the TPU for computation.
 
 ### Transformer Model
 
 The GPT2 model is defined in `model.py`. It begins with a token embedding layer, then applies a sequence of Transformer blocks, and ends with a language-model head that projects hidden states back to the vocabulary for next-token prediction.
 
-Each Transformer block contains multi-head-query causal self-attention and an MLP, both wrapped with RMSNorm and residual connections. Check this [slides](https://cs231n.stanford.edu/slides/2025/lecture_8.pdf) for the attention and transformers. The attention path supports two implementations: a native XLA attention path and a Pallas flash-attention kernel (`nanogpt/pallas/flash_attention.py`) for fused execution. The model supports [activation checkpointing](https://docs.jax.dev/en/latest/gradient-checkpointing.html) to reduce activation memory usage.
+Each Transformer block contains multi-head self-attention and an MLP, both wrapped with RMSNorm and residual connections. For background on attention and Transformers, see these [slides](https://cs231n.stanford.edu/slides/2025/lecture_8.pdf). The attention path supports two implementations: a native XLA attention path and a Pallas FlashAttention kernel (`nanogpt/pallas/flash_attention.py`) for fused execution. The model also supports [activation checkpointing](https://docs.jax.dev/en/latest/gradient-checkpointing.html), which can reduce activation memory usage during training.
 
 ### Optimizer
 
@@ -67,11 +67,11 @@ Experiment settings are stored in YAML files under `configs/`, such as `configs/
 
 ## Assignment(100 points)
 
-Your assignment is to understand the training computation and profile & analysis the memory and latency.
+This assignment aims to help you understand the computation involved in LLM training and to profile and analyze its memory usage and step latency.
 
 ### Part1(20 points)
 
-This part is write-up only, you don't need to run any experiments. Your task is to explain the forward computation in `block_forward`, including the shapes of the model weights and forward activations (e.g., the output of `attn_forward`). Your write-up should also describe the underlying computation, such as how self-attention is computed. When discussing tensor shapes, use the terminology and parameter names defined in the configs.
+This part is write-up only, you don't need to run any experiments. Your task is to explain the forward computation in `block_forward` inside `model.py`, including the shapes of the model weights and forward activations (e.g., the output of `attn_forward`). Your write-up should also describe the underlying computation, such as how self-attention is computed. When discussing tensor shapes, use the terminology and parameter names defined in the configs.
    ```
    model:
       seqlen: 2048
@@ -81,9 +81,6 @@ This part is write-up only, you don't need to run any experiments. Your task is 
       num_layers: 5
       q_heads: 6
       kv_heads: 6
-      attn_impl: xla    # "flash_attn" or "xla"
-      activation_checkpointing: false
-      dtype: bfloat16
    ```
 
 ### Part2(60 points)
@@ -96,14 +93,14 @@ Answer the following questions. For each question, attach a screenshot of the Me
 
 1. 20 points. Explain the memory spikes and the increases or decreases in memory usage, or other phenomenons. Relate these changes to the lifecycle of different memory states during training.
 2. 15 points. Enable activation checkpointing by setting `activation_checkpointing: true`. How does this change the Memory Viewer profile? How does it affect the per-step training latency?
-3. 15 points. Also enable the Pallas FlashAttention kernel by setting `attn_impl: flash_attn`. How does this change the Memory Viewer profile?
+3. 15 points. Starting from the configuration in 2, also enable the Pallas FlashAttention kernel by setting `attn_impl: flash_attn`. How does this change the Memory Viewer profile?
 
 ### Part3(20 points)
 
-This part focuses on step latency profiling. You should run the profiler with configs/project1-part3.yaml and use the Trace Viewer to answer the following questions:
+This part focuses on step latency profiling. You should run the profiler with `configs/project1-part3.yaml` and use the Trace Viewer to answer the following questions:
 
 1. 10 points. Identify the two most time-consuming computations within a single Transformer layer.
-2. 10 points. For sequence lengths [1024,2048,4096], measure and report the latency of these two operations. Describe the trend you observe, and explain it with the operation computational characteristics. Finally, for long-context training (e.g., 128K tokens), discuss which operation you expect to become the bottleneck.
+2. 10 points. For sequence lengths in [1024, 2048, 4096], measure and report the latency of these two operations. Describe the trend you observe, and explain it with the operation computational characteristics. Finally, for long-context training (e.g., 128K tokens), discuss which operation you expect to become the bottleneck.
 
 ## Submission
 
