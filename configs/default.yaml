@@ -8,7 +8,8 @@ model:
   num_layers: 24
   q_heads: 12
   kv_heads: 12
-  attn_impl: xla    # "flash_attn" or "xla"
+  attn_impl: flash_attn    # "flash_attn" or "xla"
+  activation_checkpointing: true
   dtype: bfloat16
 
 hparams:

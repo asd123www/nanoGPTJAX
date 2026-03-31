@@ -70,14 +70,6 @@ python3.11 nanogpt/train.py --config configs/small.yaml
 
 Edit `configs/small.yaml` to change model size, hyperparameters, checkpoint paths, and data directory.
 
-## Inference
-
-```bash
-python3.11 nanogpt/inference.py --config configs/small.yaml
-```
-
-This starts an interactive prompt where you type text and the model generates a completion. Make sure the checkpoint path in your config file points to a valid trained checkpoint.
-
 ## Profiling
 
 ```bash
@@ -150,7 +142,7 @@ The baseline configuration for this part is:
 ### Tasks
 
 1. Set `model.attn_impl: xla` in the config.
-2. Disable activation checkpointing by removing or commenting out the `@jax.checkpoint` decorator on `_checkpointed_block` in `nanogpt/fsdp.py`.
+2. Disable activation checkpointing by removing or commenting out the `@jax.checkpoint` decorator on `_checkpointed_block_forward` in `nanogpt/model.py`.
 3. Run training long enough to capture one profiler window.
 4. Open the TensorBoard profile and inspect both the trace view and the memory view.
 5. Explain the main memory spikes and major trends across one training step.
@@ -189,7 +181,7 @@ After completing this project, students should be able to:
 
 ### Tasks
 
-1. Re-enable the `@jax.checkpoint` decorator in `nanogpt/fsdp.py`.
+1. Re-enable the `@jax.checkpoint` decorator on `_checkpointed_block_forward` in `nanogpt/model.py`.
 2. Rerun the same experiment as in Part 2.2.
 3. Compare the memory footprint with the baseline.
 4. Compare the step latency with the baseline.
@@ -293,7 +285,7 @@ To make grading easier, organize your report as follows:
 
 - The model definition is controlled primarily by the `model` section of `configs/project1.yaml`.
 - The training loop starts and stops profiler tracing in `nanogpt/train.py`.
-- Activation checkpointing is currently implemented in `nanogpt/fsdp.py`.
+- Activation checkpointing is currently implemented in `nanogpt/model.py`.
 - Attention implementation is selected by `model.attn_impl`.
 - For memory accounting, it is often easier to describe one transformer block carefully and then multiply by `num_layers`.
 - For latency analysis, you may aggregate multiple low-level launches if the trace viewer splits one logical operation into several kernels. If you do so, explain your aggregation rule clearly.

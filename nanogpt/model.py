@@ -5,20 +5,13 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from kvcache import update_slice
-from kvcache import count_left_padding
-from kvcache import make_attention_mask
-from kvcache import length_minus_right_padding
-from kvcache import segment_ids_to_positions
-
 from utils import layer_repr
 from utils import ParamSpec, ParamInitializer
 from utils import jax_pytree_struct
 from pallas.flash_attention import flash_attention as pallas_flash_attention
 
 ATTN_IMPL = "flash_attn"
-FLASH_ATTN_MESH = None
-FLASH_ATTN_AXIS_NAME = None
+ACTIVATION_CHECKPOINTING = True
 
 
 def linear_init(fan_in, fan_out):
@@ -165,25 +158,9 @@ def set_attn_impl(impl: str):
     ATTN_IMPL = impl
 
 
-def set_flash_attn_mesh(mesh, axis_name):
-    """Set the mesh used to run the Pallas flash kernel via `shard_map`."""
-    global FLASH_ATTN_MESH, FLASH_ATTN_AXIS_NAME
-    FLASH_ATTN_MESH = mesh
-    FLASH_ATTN_AXIS_NAME = axis_name
-
-# somehow Pallas flash_attn doesn't work with DP, needs to specify per-device behavior.
-def _flash_attention_forward(q, k, v, scale):
-    if FLASH_ATTN_MESH is None:
-        return pallas_flash_attention(q, k, v, causal=True, sm_scale=scale)
-
-    batch_spec = P(FLASH_ATTN_AXIS_NAME, None, None, None)
-    return jax.shard_map(
-        lambda q, k, v: pallas_flash_attention(q, k, v, causal=True, sm_scale=scale),
-        mesh=FLASH_ATTN_MESH,
-        in_specs=(batch_spec, batch_spec, batch_spec),
-        out_specs=batch_spec,
-        check_vma=False,
-    )(q, k, v)
+def set_activation_checkpointing(enabled: bool):
+    global ACTIVATION_CHECKPOINTING
+    ACTIVATION_CHECKPOINTING = bool(enabled)
 
 
 @jax_pytree_struct
@@ -310,15 +287,6 @@ def mlp_forward(params, x):
     return x
 
 
-# Though we can combine the cache update this in this block. I keep two versions
-# of attention_forward and block_forward because it lets me optimize whatever
-# cache implementation I want during the inference time without changing the
-# training code. This lets me keep running my experiments in parallel. Redundancy
-# in this case is good.
-
-#################################### For training ########################################
-
-
 def attn_forward(params, x, mask, freqs):
     orig_dtype = x.dtype
     sin, cos = freqs
@@ -353,7 +321,10 @@ def attn_forward(params, x, mask, freqs):
                 k = jnp.repeat(k, repeats, axis=1)
                 v = jnp.repeat(v, repeats, axis=1)
 
-            attn = _flash_attention_forward(q, k, v, scale).astype(orig_dtype)
+            attn = pallas_flash_attention(
+                q, k, v, 
+                causal=True, sm_scale=scale
+            ).astype(orig_dtype)
         else:
             # Materialize the mask tensor: https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html.
             if mask is not None:
@@ -393,6 +364,11 @@ def block_forward(params, x, mask, freqs):
     return x
 
 
+@jax.checkpoint
+def _checkpointed_block_forward(block, x, mask, freqs):
+    return block_forward(block, x, mask, freqs)
+
+
 def compute_segment_mask(segment_ids):
     """Compute once, reuse across all layers. Returns (B, 1, T, S) bias or None."""
     if segment_ids is None:
@@ -423,7 +399,10 @@ def forward(params, x, segment_ids, freqs):
         x = embedding_forward(params.embed, x)
 
     for block in params.blocks:
-        x = block_forward(block, x, mask, freqs)
+        if ACTIVATION_CHECKPOINTING:
+            x = _checkpointed_block_forward(block, x, mask, freqs)
+        else:
+            x = block_forward(block, x, mask, freqs)
 
     with jax.named_scope("norm"):
         x = rmsnorm_forward(x)
@@ -435,135 +414,3 @@ def forward(params, x, segment_ids, freqs):
         logits = logits.astype(jnp.float32)
         logits = 15.0 * jnp.tanh(logits / 15.0)
     return logits
-
-
-#################################### For inference ########################################
-
-
-def attn_forward_v2(params, x, segment_ids, freqs, cache, idx):
-    orig_dtype = x.dtype
-    sin, cos = freqs
-
-    # 1. QKV Projection: (B, T, D) -> (B, T, H, D)
-    with jax.named_scope("qkv_matmul"):
-        q = jnp.einsum("btd, dhq -> bthq", x, params.wq)
-        k = jnp.einsum("btd, dhq -> bthq", x, params.wk)
-        v = jnp.einsum("btd, dhq -> bthq", x, params.wv)
-
-    # 2. Norm: (B, T, H, D)
-    with jax.named_scope("qk_norm"):
-        q = rmsnorm_forward(q)
-        k = rmsnorm_forward(k)
-
-    # 3. RoPE: (B, T, H, D)
-    with jax.named_scope("rope"):
-        q = calculate_rope(q, sin, cos)
-        k = calculate_rope(k, sin, cos)
-
-    # 4. Cache updates. Cache shape: (B, H, T, D)
-    with jax.named_scope("cache_update"):
-        kt = jnp.transpose(k, (0, 2, 1, 3))
-        vt = jnp.transpose(v, (0, 2, 1, 3))
-        it = jnp.maximum(cache.iter, 0)
-
-        k_updated = update_slice(cache.k[idx], kt, it, update_axis=cache.time_axis)
-        v_updated = update_slice(cache.v[idx], vt, it, update_axis=cache.time_axis)
-        cache_updates = (k_updated, v_updated)
-
-        # fmt: off
-        # Compute masks using original logic
-        additional_tokens = jnp.max(length_minus_right_padding(segment_ids))
-        time_indices = (jnp.arange(0, v_updated.shape[-2])[None, :] - cache.starts[:, None]) % cache.size
-        q_segment_ids = jnp.where(segment_ids != 0, 1, 0)
-        kv_segment_ids = (time_indices >= 0) & (time_indices < cache.fill_len()[:, None] + additional_tokens)
-        q_offset = cache.fill_len() - count_left_padding(q_segment_ids, pad_id=0)
-        kv_offset = -cache.starts
-
-        # If we directly use transpose in attention, it will throw an error
-        # because the array layout is not contiguous. In JAX, the only way
-        # to ensure that arrays are contagious is to make an **explicit** copy.
-        kt = jnp.copy(jnp.transpose(k_updated, (0, 2, 1, 3)))
-        vt = jnp.copy(jnp.transpose(v_updated, (0, 2, 1, 3)))
-        # fmt: on
-
-    # 5. Attention
-    with jax.named_scope("attention"):
-        qlen = q.shape[1]
-        kvlen = k_updated.shape[2]
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        mask = make_attention_mask(
-            qlen, kvlen, q_segment_ids, kv_segment_ids, q_offset, kv_offset, causal=True
-        )
-
-        # fmt: off
-        attn = jax.nn.dot_product_attention(
-            q,          # (B, T, H, D)
-            kt,         # (B, S, H, D)
-            vt,         # (B, S, H, D)
-            mask=mask,  # (B, 1, T, S)
-            implementation="xla",
-            scale=scale
-        ).astype(orig_dtype)
-        # fmt: on
-
-    # 6. Projection
-    with jax.named_scope("projection"):
-        out = jnp.einsum("bthq, hqd->btd", attn, params.wo)
-    return out, cache_updates
-
-
-def block_forward_v2(params, x, segment_ids, freqs, cache, idx):
-    with jax.named_scope("pre_attn_norm"):
-        attn_in = rmsnorm_forward(x)
-
-    attn_out, cache_updates = attn_forward_v2(
-        params.attn, attn_in, segment_ids, freqs, cache, idx
-    )
-
-    with jax.named_scope("residual"):
-        x = x + attn_out
-
-    with jax.named_scope("post_attn_norm"):
-        ffn_in = rmsnorm_forward(x)
-
-    with jax.named_scope("ffn"):
-        ffn_out = mlp_forward(params.mlp, ffn_in)
-
-    with jax.named_scope("residual"):
-        x = x + ffn_out
-    return x, cache_updates
-
-
-def forward_v2(params, x, segment_ids, cache, head_dim):
-    with jax.named_scope("embedding"):
-        x = embedding_forward(params.embed, x)
-
-    positions = segment_ids_to_positions(segment_ids)
-    positions = positions + cache.fill_len()[:, None]
-    freqs = precompute_frequencies(positions, features=head_dim, dtype=x.dtype)
-
-    all_cache_updates = []
-    for idx, block in enumerate(params.blocks):
-        x, cache_updates = block_forward_v2(block, x, segment_ids, freqs, cache, idx)
-        all_cache_updates.append(cache_updates)
-
-    with jax.named_scope("norm"):
-        x = rmsnorm_forward(x)
-
-    with jax.named_scope("unembed"):
-        logits = linear_forward(params.lm_head, x)
-
-    with jax.named_scope("logit_soft_capping"):
-        logits = 15.0 * jnp.tanh(logits.astype(jnp.float32) / 15.0)
-
-    # Update cache
-    new_k = [z[0] for z in all_cache_updates]
-    new_v = [z[1] for z in all_cache_updates]
-    additional_tokens = jnp.max(length_minus_right_padding(segment_ids))
-    cache = dataclasses.replace(
-        cache,
-        k=new_k,
-        v=new_v,
-        iter=(jnp.maximum(0, cache.iter) + additional_tokens) % cache.size,
-    )
-    return logits, cache

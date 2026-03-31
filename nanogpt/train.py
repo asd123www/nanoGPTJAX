@@ -19,8 +19,7 @@ from jax.sharding import set_mesh
 
 from model import count_params
 from model import precompute_frequencies
-from model import GPT, forward, set_attn_impl, set_flash_attn_mesh
-from fsdp import shard_params, make_fsdp_forward
+from model import GPT, forward, set_activation_checkpointing, set_attn_impl
 from utils import DP_AXIS_NAME, print_param_info
 from optim import build_optimizer
 from config import load_config_from_yaml
@@ -193,13 +192,12 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    # FSDP: fully sharded data parallel.
     assert jax.default_backend() == "tpu", (f"Expected TPU backend, got '{jax.default_backend()}'")
-    devices = np.array(jax.devices())
+    devices = np.array(jax.devices()[:1])
     mesh = Mesh(devices, (DP_AXIS_NAME,))
     cfg = load_config_from_yaml(args.config, mesh=mesh)
     set_attn_impl(cfg.model.attn_impl)
-    set_flash_attn_mesh(mesh, DP_AXIS_NAME)
+    set_activation_checkpointing(cfg.model.activation_checkpointing)
 
     # Prepare the data loaders.
     train_files = list(Path(cfg.data_dir).glob("*train*.bin"))
@@ -230,11 +228,6 @@ if __name__ == "__main__":
     print("Building GPT model based on the config...")
     model = GPT.init(jax.random.PRNGKey(0), cfg)
     print("Model built successfully!", model)
-
-    # FSDP: shard parameters and override forward with per-block unshard/reshard
-    model = shard_params(model, mesh)
-    forward = make_fsdp_forward(mesh)  # noqa: F811 — intentional rebind
-    print("FSDP sharding applied.")
     print_param_info(model, mesh)
 
     optim, optim_state = build_optim(model, cfg, grad_accum_steps)
@@ -262,6 +255,7 @@ if __name__ == "__main__":
     print("\n" + "-" * 75 + "\n")
     print(line("Number of trainable params", count_params(model), comma=True))
     print(line("Attention implementation", cfg.model.attn_impl))
+    print(line("Activation checkpointing", cfg.model.activation_checkpointing))
     print(line("Sequence length per sample", cfg.model.seqlen))
     print(line("Micro batch size", cfg.hparams.micro_batch_size))
     print(line("Global batch size", cfg.hparams.global_batch_size))

@@ -102,6 +102,7 @@ class ModelConfig:
     q_heads: int = 8
     kv_heads: int = 4
     attn_impl: str = "flash_attn"
+    activation_checkpointing: bool = True
     dtype: jnp.dtype = jnp.bfloat16
 
     embed: EmbeddingConfig = dataclasses.field(init=False)
