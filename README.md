@@ -67,15 +67,44 @@ Experiment settings are stored in YAML files under `configs/`, such as `configs/
 
 ## Assignment(100 points)
 
+Your assignment is to understand the training computation and profile & analysis the memory and latency.
 
 ### Part1(20 points)
 
+This part is write-up only, you don't need to run any experiments. Your task is to explain the forward computation in `block_forward`, including the shapes of the model weights and forward activations (e.g., the output of `attn_forward`). Your write-up should also describe the underlying computation, such as how self-attention is computed. When discussing tensor shapes, use the terminology and parameter names defined in the configs.
+   ```
+   model:
+      seqlen: 2048
+      vocab_size: 50304
+      d_emb: 1536
+      mlp_hidden_dim: 4096
+      num_layers: 5
+      q_heads: 6
+      kv_heads: 6
+      attn_impl: xla    # "flash_attn" or "xla"
+      activation_checkpointing: false
+      dtype: bfloat16
+   ```
+
 ### Part2(60 points)
+
+This part focuses on memory profiling. Conceptually, we divide memory usage into two categories: model states and residual states. Model states include the model weights and optimizer states. Residual states include activations, temporary buffers, and other intermediate data created during training.
+
+You are expected to run the training script, analysis the profiling-related information in the output, and then use TensorBoard to visualize the profiling results (see Step 5 in the Prep Work).
+
+Answer the following questions. For each question, attach a screenshot of the Memory Viewer:
+
+1. 20 points. Explain the memory spikes and the increases or decreases in memory usage, or other phenomenons. Relate these changes to the lifecycle of different memory states during training.
+2. 15 points. Enable activation checkpointing by setting `activation_checkpointing: true`. How does this change the Memory Viewer profile? How does it affect the per-step training latency?
+3. 15 points. Also enable the Pallas FlashAttention kernel by setting `attn_impl: flash_attn`. How does this change the Memory Viewer profile?
 
 ### Part3(20 points)
 
+This part focuses on step latency profiling. You should run the profiler with configs/project1-part3.yaml and use the Trace Viewer to answer the following questions:
 
+1. 10 points. Identify the two most time-consuming computations within a single Transformer layer.
+2. 10 points. For sequence lengths [1024,2048,4096], measure and report the latency of these two operations. Describe the trend you observe, and explain it with the operation computational characteristics. Finally, for long-context training (e.g., 128K tokens), discuss which operation you expect to become the bottleneck.
 
 ## Submission
 
-
+Please submit a PDF report of your Lab 1 write-up. Make sure your name and student ID are included in the report, and upload the final PDF to Canvas.
